@@ -192,12 +192,8 @@ impl Bus {
                 self.irq4_mask = (data & 7) ^ 4;
                 self.irq_state = 0;
             }
-            0x201 => {
-                self.irq4_period[0] = (0x1000 - (data & 0xfff)) as f64 * IRQ4_PASSES_PER_UNIT
-            }
-            0x202 => {
-                self.irq4_period[1] = (0x1000 - (data & 0xfff)) as f64 * IRQ4_PASSES_PER_UNIT
-            }
+            0x201 => self.irq4_period[0] = (0x1000 - (data & 0xfff)) as f64 * IRQ4_PASSES_PER_UNIT,
+            0x202 => self.irq4_period[1] = (0x1000 - (data & 0xfff)) as f64 * IRQ4_PASSES_PER_UNIT,
             _ => {}
         }
         if off < 4 {
@@ -585,9 +581,7 @@ impl Bus {
                 }
             }
             0x4000_0000..=0x40bf_ffff => self.io_w((a - 0x4000_0000) >> 1, v),
-            0x40c0_0000..=0x40c0_07ff => {
-                self.u16_w(((a - 0x40c0_0000) >> 1) & 0x203, v, mem_mask)
-            }
+            0x40c0_0000..=0x40c0_07ff => self.u16_w(((a - 0x40c0_0000) >> 1) & 0x203, v, mem_mask),
             _ => {}
         }
     }
@@ -764,7 +758,11 @@ impl Board {
         let b = &self.bus;
         let lines = b.intreg[0x1c] & b.intreg[0x1d] & 0x7f00;
         let l = lines >> 7;
-        if l == 0 { 0 } else { 15 - l.leading_zeros() as u8 }
+        if l == 0 {
+            0
+        } else {
+            15 - l.leading_zeros() as u8
+        }
     }
 
     fn update_isr(&mut self) {
@@ -846,11 +844,36 @@ impl Board {
 /// Per-game hardware facts from PinMAME `capgames.c`: (set prefix, display width, switch board,
 /// inverted switches by row).
 const GAMES: &[(&str, usize, bool, &[u8])] = &[
-    ("pmv", 128, true, &[0, 0x00, 0x3f, 0x04, 0x00, 0x00, 0x08, 0x00, 0x0e]),
-    ("abv", 128, true, &[0, 0x00, 0x70, 0x40, 0x78, 0x00, 0x40, 0x80, 0x03]),
-    ("bsv", 128, false, &[0, 0x00, 0x00, 0x38, 0x00, 0x30, 0x00, 0x01]),
-    ("bsb", 128, false, &[0, 0x00, 0x00, 0x38, 0x00, 0x30, 0x00, 0x01]),
-    ("pp1", 128, false, &[0, 0x00, 0x00, 0x38, 0x00, 0x30, 0x00, 0x01]),
+    (
+        "pmv",
+        128,
+        true,
+        &[0, 0x00, 0x3f, 0x04, 0x00, 0x00, 0x08, 0x00, 0x0e],
+    ),
+    (
+        "abv",
+        128,
+        true,
+        &[0, 0x00, 0x70, 0x40, 0x78, 0x00, 0x40, 0x80, 0x03],
+    ),
+    (
+        "bsv",
+        128,
+        false,
+        &[0, 0x00, 0x00, 0x38, 0x00, 0x30, 0x00, 0x01],
+    ),
+    (
+        "bsb",
+        128,
+        false,
+        &[0, 0x00, 0x00, 0x38, 0x00, 0x30, 0x00, 0x01],
+    ),
+    (
+        "pp1",
+        128,
+        false,
+        &[0, 0x00, 0x00, 0x38, 0x00, 0x30, 0x00, 0x01],
+    ),
     ("ffv", 256, true, &[0, 0x0f, 0x0f, 0x8c, 0x80]),
     ("bbb", 128, true, &[0, 0x00, 0x01, 0x78, 0x00, 0x00, 0x01]),
     ("kpb", 128, true, &[0, 0x01, 0x00, 0x78, 0x88, 0x08, 0x10]),
@@ -914,7 +937,10 @@ pub fn board_for(dir: &str) -> Board {
         .find(|g| set.starts_with(g.0))
         .unwrap_or_else(|| panic!("unknown Capcom set {set}"));
     let mut b = Board::new(load_rom(dir), g.1, g.2, g.3);
-    if let Some(d) = std::env::var("CAP_NVRAM").ok().and_then(|p| std::fs::read(p).ok()) {
+    if let Some(d) = std::env::var("CAP_NVRAM")
+        .ok()
+        .and_then(|p| std::fs::read(p).ok())
+    {
         b.bus.nvram[..d.len()].copy_from_slice(&d);
     }
     b
@@ -926,7 +952,12 @@ type Recorded = Vec<(u64, Vec<u8>)>;
 fn write_frame(o: &mut impl std::io::Write, ms: u64, f: &[u8], w: usize) {
     writeln!(o, "0x{ms:08x}").unwrap();
     for row in f.chunks(w) {
-        writeln!(o, "{}", row.iter().map(|v| (b'0' + v) as char).collect::<String>()).unwrap();
+        writeln!(
+            o,
+            "{}",
+            row.iter().map(|v| (b'0' + v) as char).collect::<String>()
+        )
+        .unwrap();
     }
     writeln!(o).unwrap();
 }
@@ -1028,17 +1059,26 @@ pub fn cli(args: &[String]) {
                 };
                 if neg { -x } else { x }
             };
-            let envhex = |k: &str| std::env::var(k).ok().map(|v| u32::from_str_radix(&v, 16).unwrap());
+            let envhex = |k: &str| {
+                std::env::var(k)
+                    .ok()
+                    .map(|v| u32::from_str_radix(&v, 16).unwrap())
+            };
             let dmadd = envhex("CAP_DMADD").expect("CAP_DMADD");
             let cur = envhex("CAP_CUR");
             let slots: Option<Vec<u32>> = std::env::var("CAP_SLOTS").ok().map(|v| {
-                v.split(',').map(|x| u32::from_str_radix(x, 16).unwrap()).collect()
+                v.split(',')
+                    .map(|x| u32::from_str_radix(x, 16).unwrap())
+                    .collect()
             });
             let layout: Vec<(bool, Option<u32>)> = std::env::var("CAP_LAYOUT")
                 .unwrap_or("l,l,w,w=8,l".into())
                 .split(',')
                 .map(|a| {
-                    let (k, v) = a.split_once('=').map(|(k, v)| (k, Some(v))).unwrap_or((a, None));
+                    let (k, v) = a
+                        .split_once('=')
+                        .map(|(k, v)| (k, Some(v)))
+                        .unwrap_or((a, None));
                     (k == "l", v.map(|v| u32::from_str_radix(v, 16).unwrap()))
                 })
                 .collect();
@@ -1071,9 +1111,9 @@ pub fn cli(args: &[String]) {
                 }
                 let mut a = b.cpu.dar[15] + 4;
                 for (k, (long, force)) in layout.iter().enumerate() {
-                    let v = force.map(|v| v as i64).or_else(|| {
-                        f.get(k + 1).filter(|v| **v != "?").map(|v| hexs(v))
-                    });
+                    let v = force
+                        .map(|v| v as i64)
+                        .or_else(|| f.get(k + 1).filter(|v| **v != "?").map(|v| hexs(v)));
                     if let Some(v) = v {
                         if *long {
                             b.bus.write_long(a, v as u32);

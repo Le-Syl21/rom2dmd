@@ -796,7 +796,11 @@ impl Sam {
         while self.bus.cycles < end {
             // next event
             let mut next = end
-                .min(if self.cap_at != 0 { self.cap_at } else { u64::MAX })
+                .min(if self.cap_at != 0 {
+                    self.cap_at
+                } else {
+                    u64::MAX
+                })
                 .min(self.next_fiq.ceil() as u64)
                 .min(self.next_dmd.ceil() as u64);
             next = next.min(self.next_zc.ceil() as u64);
@@ -845,8 +849,7 @@ impl Sam {
                     t.next += t.period;
                     t.counter = 0;
                     t.status |= 0x10;
-                    if t.irq_mask & 0x10 != 0 && (!self.bus.block_timers || self.cpu.irq_enable())
-                    {
+                    if t.irq_mask & 0x10 != 0 && (!self.bus.block_timers || self.cpu.irq_enable()) {
                         self.bus.fire_irq(4 + n as u32);
                     }
                 }
@@ -864,7 +867,8 @@ impl Sam {
                     // both page registers are written within a few instructions: look 0.5 ms
                     // later, and no sooner than 10 ms after the last look (an effect forced with
                     // bogus arguments can flip pages every millisecond; the panel would blend them)
-                    self.cap_at = (self.bus.cycles + CLOCK_HZ / 2000).max(self.last_cap + CLOCK_HZ / 100);
+                    self.cap_at =
+                        (self.bus.cycles + CLOCK_HZ / 2000).max(self.last_cap + CLOCK_HZ / 100);
                 }
             }
             if self.cap_at != 0 && self.bus.cycles >= self.cap_at {
@@ -1004,7 +1008,10 @@ fn rom_name(path: &str) -> String {
 pub fn write_frame(o: &mut impl std::io::Write, ms: u64, f: &[u8; 4096]) {
     writeln!(o, "0x{ms:08x}").unwrap();
     for row in f.chunks(128) {
-        let s: String = row.iter().map(|v| char::from_digit(*v as u32, 16).unwrap()).collect();
+        let s: String = row
+            .iter()
+            .map(|v| char::from_digit(*v as u32, 16).unwrap())
+            .collect();
         writeln!(o, "{s}").unwrap();
     }
     writeln!(o).unwrap();
@@ -1081,7 +1088,9 @@ pub fn cli(args: &[String]) {
                 // call from a task that is not a display effect itself (CURTASK = RAM word holding the
                 // current task, its flags u16 at +2, TFLAG = display-effect task flag)
                 let curtask = env("CURTASK").map(|v| u32::from_str_radix(&v, 16).unwrap());
-                let tflag: u16 = env("TFLAG").map(|v| u16::from_str_radix(&v, 16).unwrap()).unwrap_or(4);
+                let tflag: u16 = env("TFLAG")
+                    .map(|v| u16::from_str_radix(&v, 16).unwrap())
+                    .unwrap_or(4);
                 let ok = move |s: &mut Sam| match curtask {
                     Some(ct) => {
                         let t = s.peek32(ct);
@@ -1118,7 +1127,8 @@ pub fn cli(args: &[String]) {
                 println!(
                     "{id:3} {kind:5} ret {:08x} end {} frames {}",
                     r.unwrap_or(u32::MAX),
-                    fell.map(|t| format!("{:.2}", ms(t) as f64 / 1000.0)).unwrap_or("-".into()),
+                    fell.map(|t| format!("{:.2}", ms(t) as f64 / 1000.0))
+                        .unwrap_or("-".into()),
                     s.flips.len()
                 );
                 let mut o = std::io::BufWriter::new(
@@ -1133,7 +1143,10 @@ pub fn cli(args: &[String]) {
         "sam-dump" => {
             let rom = load_rom(&args[2]);
             let mut s = Sam::new(rom, &rom_name(&args[2]));
-            s.run((args[3].parse::<f64>().unwrap() * CLOCK_HZ as f64) as u64, &mut |_| {});
+            s.run(
+                (args[3].parse::<f64>().unwrap() * CLOCK_HZ as f64) as u64,
+                &mut |_| {},
+            );
             std::fs::write(format!("{}.page0", args[4]), &s.bus.page0).unwrap();
             std::fs::write(format!("{}.ram", args[4]), &s.bus.ram).unwrap();
             std::fs::write(format!("{}.nvram", args[4]), &s.bus.nvram).unwrap();

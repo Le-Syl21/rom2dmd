@@ -95,7 +95,11 @@ impl MemoryMapper for Hw {
             XWrite::Ram(a, v) => self.ram[a] = v,
             XWrite::Ctl(0xa000, v) => self.bank = ((v & 0x1f) as usize) * 0x8000,
             XWrite::Ctl(0xb000, v) => {
-                self.rowstart = if self.pca020 { v & 0x7f } else { (v & 0x1f) | 0x20 }
+                self.rowstart = if self.pca020 {
+                    v & 0x7f
+                } else {
+                    (v & 0x1f) | 0x20
+                }
             }
             XWrite::Ctl(0xc000, v) => self.colstart = v,
             XWrite::Ctl(..) => {}
@@ -249,7 +253,11 @@ impl Board {
         }
         sfr[(0x81 & 0x7f) as usize] = 0x07; // SP
         let pca020 = std::env::var("ALVG_PCA020").is_ok_and(|v| v == "1");
-        let int1_clocks = if pca020 { INT1_CLOCKS_PCA020 } else { INT1_CLOCKS };
+        let int1_clocks = if pca020 {
+            INT1_CLOCKS_PCA020
+        } else {
+            INT1_CLOCKS
+        };
         Board {
             cpu: Cpu::new(),
             hw: Hw {
