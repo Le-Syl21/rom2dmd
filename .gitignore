@@ -1,0 +1,6 @@
+/target
+/target-*
+*.zip
+*.rom
+*.bin
+/out
