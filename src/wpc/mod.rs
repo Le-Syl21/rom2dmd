@@ -15,7 +15,10 @@
 
 pub mod bus;
 pub mod dmd;
+pub mod games;
 pub mod pic;
+pub mod probe;
+pub mod scan;
 pub mod sound;
 pub mod timing;
 
@@ -84,6 +87,10 @@ pub struct Compat {
     /// them). AFM pushes a return address with S = 0 while booting, which overwrites the
     /// reset vector in WPC-EMU, so its next reset starts at 0x8ebf instead of 0x8dd4.
     pub rom_writes: bool,
+    /// WPC-EMU's 6809 flag quirks: NEG sets carry from bit 7 of the result (the 6809 sets it
+    /// when the result is not 0) and DAA clears a carry it does not produce (the 6809 keeps
+    /// it). Games use DAA for BCD scores, so a played game drifts without this.
+    pub cpu_quirks: bool,
 }
 
 impl Compat {
@@ -94,6 +101,7 @@ impl Compat {
             pic_559: true,
             zero_top_banks: true,
             rom_writes: true,
+            cpu_quirks: true,
         }
     }
 }
@@ -251,7 +259,56 @@ impl Board {
         } else {
             0
         };
+        // WPC-EMU flag quirks (see `Compat::cpu_quirks`): opcode and DAA inputs before the step
+        let quirk = if self.compat.cpu_quirks && entry == Entry::None {
+            let g = self.cpu.registers();
+            Some((self.bus.peek(g.pc), g.a(), g.cc.to_byte()))
+        } else {
+            None
+        };
         let real = self.cpu.step(&mut self.bus);
+        if let Some((op, a, cc)) = quirk {
+            const C: u8 = 0x01;
+            const V: u8 = 0x02;
+            const Z: u8 = 0x04;
+            const N: u8 = 0x08;
+            const H: u8 = 0x20;
+            match op {
+                // NEG direct / NEGA / NEGB / NEG indexed / NEG extended: C = N
+                0x00 | 0x40 | 0x50 | 0x60 | 0x70 => {
+                    let mut g = self.cpu.registers_mut();
+                    let f = g.cc.to_byte();
+                    let c = if f & N != 0 { C } else { 0 };
+                    g.cc = mc6809_core::ConditionCodes::from_byte((f & !C) | c);
+                }
+                0x19 => {
+                    let (hi, lo) = (a & 0xf0, a & 0x0f);
+                    let mut corr = 0u16;
+                    if lo > 9 || cc & H != 0 {
+                        corr |= 0x06;
+                    }
+                    if (hi > 0x80 && lo > 9) || hi > 0x90 || cc & C != 0 {
+                        corr |= 0x60;
+                    }
+                    let r = corr + a as u16;
+                    let v = r as u8;
+                    let mut f = cc & !(C | N | Z | V);
+                    if r & 0x100 != 0 {
+                        f |= C;
+                    }
+                    if v == 0 {
+                        f |= Z;
+                    }
+                    if v & 0x80 != 0 {
+                        f |= N;
+                    }
+                    let mut g = self.cpu.registers_mut();
+                    g.set_a(v);
+                    g.cc = mc6809_core::ConditionCodes::from_byte(f);
+                }
+                _ => {}
+            }
+        }
         if self.cpu.illegal() {
             self.cpu.clear_illegal();
         }
@@ -308,6 +365,25 @@ impl Board {
         while self.cycles < end {
             self.step(&mut on_refresh);
         }
+    }
+
+    /// Load `snapshot` the way WPC-EMU's `setState` does, for `--compat` replays of the scene
+    /// tracer: WPC-EMU does not save the CPU's pending interrupt lines, the DMD's active page,
+    /// the watchdog counter, the security PIC or the sound interface, so those keep the values
+    /// of the machine being overwritten (`self`), and a missing pending DMD page becomes page 0
+    /// (`undefined & 0xf`). Everything else comes from the snapshot.
+    pub fn restore_like_wpc_emu(&mut self, snapshot: &Board) {
+        let mut b = snapshot.clone();
+        b.irq_pending = self.irq_pending;
+        b.firq_pending = self.firq_pending;
+        b.cpu.set_irq(self.irq_pending);
+        b.cpu.set_firq(self.firq_pending);
+        b.bus.dmd.active = self.bus.dmd.active;
+        b.bus.dmd.next_active = Some(snapshot.bus.dmd.next_active.unwrap_or(0));
+        b.bus.watchdog_ticks = self.bus.watchdog_ticks;
+        b.bus.pic = self.bus.pic.take();
+        b.bus.sound = std::mem::take(&mut self.bus.sound);
+        *self = b;
     }
 
     /// Read memory as the CPU would, without side effects on hardware registers.
@@ -408,7 +484,12 @@ impl<W: Write> RefreshLog<W> {
 /// `--compat` replays WPC-EMU (cycle counts, ROM check skip, PIC serial 559, top banks 0,
 /// writable ROM).
 pub fn cli(args: &[String]) {
-    if let Err(e) = run_cli(args) {
+    let res = match args.get(1).map(String::as_str) {
+        Some("wpc-scan") => scan::cli(args),
+        Some("wpc-probe") => probe::cli(args),
+        _ => run_cli(args),
+    };
+    if let Err(e) = res {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

@@ -28,6 +28,14 @@ pub struct Dmd {
     drawing: [u8; PAGE_SIZE],
     /// The last three complete pictures, oldest first (WPC games shade with page flipping).
     pub history: [[u8; PAGE_SIZE]; 3],
+    /// Scanlines clocked out since power-on (one every `CYCLES_PER_LINE` cycles): a time base
+    /// that only moves with the display, as WPC-EMU's video tick counter.
+    pub lines: u64,
+    /// When set, every CPU write to the video RAM is appended to `writes` (the scene tracer
+    /// drains it after each instruction).
+    pub log_writes: bool,
+    /// Logged writes: (page, offset in page, value).
+    pub writes: Vec<(u8, u16, u8)>,
 }
 
 /// What a scanline tick produced.
@@ -50,6 +58,9 @@ impl Default for Dmd {
             ticks: 0,
             drawing: [0; PAGE_SIZE],
             history: [[0; PAGE_SIZE]; 3],
+            lines: 0,
+            log_writes: false,
+            writes: Vec::new(),
         }
     }
 }
@@ -82,6 +93,9 @@ impl Dmd {
         let (w, off) = Self::window(addr);
         let o = self.offset(w, off);
         self.vram[o] = val;
+        if self.log_writes {
+            self.writes.push((self.map[w], off as u16, val));
+        }
     }
 
     pub fn select(&mut self, window: usize, val: u8) {
@@ -111,6 +125,7 @@ impl Dmd {
             return None;
         }
         self.ticks -= CYCLES_PER_LINE;
+        self.lines += 1;
         let line = self.scanline as usize * LINE_BYTES;
         let src = self.active as usize * PAGE_SIZE + line;
         self.drawing[line..line + LINE_BYTES].copy_from_slice(&self.vram[src..src + LINE_BYTES]);

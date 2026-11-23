@@ -120,6 +120,10 @@ pub struct Bus {
     /// Switch matrix: index 0 = cabinet (coin door) inputs, 1..=8 = matrix columns,
     /// 9 = Fliptronic switches; bit n = row n+1.
     pub switches: [u8; 10],
+    /// When set, the coin-door keys read as released once `now` passes this cycle: a short
+    /// press (WPC-EMU releases them on the first read 100 ms of wall-clock time after they
+    /// are set, and the scene tracer relies on it).
+    pub cabinet_release_at: Option<u64>,
     pub active_column: u8,
     pub dip: u8,
     pub zero_cross: bool,
@@ -158,6 +162,7 @@ impl Bus {
             rom_bank: 0,
             protect_mask: None,
             switches: [0; 10],
+            cabinet_release_at: None,
             active_column: 0,
             dip: 0,
             zero_cross: false,
@@ -300,7 +305,13 @@ impl Bus {
         let r = &self.ram;
         match addr {
             FLIPPER_COIL95 | FLIPPER_SW95 => !self.switches[9],
-            SW_CABINET => self.switches[0],
+            SW_CABINET => {
+                if self.cabinet_release_at.is_some_and(|at| self.now > at) {
+                    self.cabinet_release_at = None;
+                    self.switches[0] = 0;
+                }
+                self.switches[0]
+            }
             ROM_BANK => r[a] & self.page_mask,
             SW_ROW => match self.pic.as_mut() {
                 Some(p) => {
