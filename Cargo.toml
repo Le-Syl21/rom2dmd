@@ -10,7 +10,12 @@ m68k = "0.17.2"
 mos6502 = "0.10.1"
 i8051 = "0.25.0"
 arm32_cpu = "0.1.2"
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+# the WPC board tests run tens of emulated seconds
+[profile.test]
+opt-level = 3

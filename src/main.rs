@@ -6,6 +6,7 @@ mod de64;
 mod gts3;
 mod sam;
 mod scan;
+mod wpc;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -695,6 +696,8 @@ fn main() {
         Some(c) if c.starts_with("sam-") => sam::cli(&args),
         // cap-*: Capcom main board (see capcom.rs)
         Some(c) if c.starts_with("cap-") => capcom::cli(&args),
+        // wpc-*: Williams WPC CPU board, DMD generation (see wpc/mod.rs)
+        Some(c) if c.starts_with("wpc-") => wpc::cli(&args),
         _ => eprintln!("usage: rom2dmd de32-boot <dmd.rom> <secs> <out.txt>"),
     }
 }
