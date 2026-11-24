@@ -233,3 +233,23 @@ impl Board {
         }
     }
 }
+
+impl crate::scan::Dmd for Board {
+    const CLOCK_HZ: u64 = CLOCK_HZ;
+    const WIDTH: usize = 128;
+    fn run(&mut self, cycles: u64) {
+        Board::run(self, cycles)
+    }
+    fn send(&mut self, byte: u8) {
+        Board::send(self, byte)
+    }
+    fn busy(&self) -> bool {
+        self.bus.busy
+    }
+    fn cycles(&self) -> u64 {
+        self.cpu.cycles()
+    }
+    fn set_on_frame(&mut self, mut f: crate::scan::FrameSink) {
+        self.on_frame = Some(Box::new(move |t, px| f(t, px)));
+    }
+}

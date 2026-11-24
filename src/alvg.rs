@@ -238,9 +238,53 @@ pub struct Board {
     pub on_frame: Option<crate::scan::FrameSink>,
 }
 
+/// Board variant and the program's two addresses the scan needs.
+#[derive(Clone, Copy, Debug)]
+pub struct Cfg {
+    /// PCA020 (Al's Garage Band) instead of PCA020A.
+    pub pca020: bool,
+    /// The "next command byte" routine and the main loop's return address after calling it.
+    pub get_byte: u16,
+    pub idle_ret: u16,
+}
+
+impl Cfg {
+    /// From the environment (ALVG_PCA020, ALVG_GETBYTE, ALVG_IDLE_RET; Mystery Castle's
+    /// addresses by default).
+    pub fn from_env() -> Self {
+        Cfg {
+            pca020: std::env::var("ALVG_PCA020").is_ok_and(|v| v == "1"),
+            get_byte: env_hex("ALVG_GETBYTE", 0x0ae9),
+            idle_ret: env_hex("ALVG_IDLE_RET", 0x006a),
+        }
+    }
+
+    /// Find the two addresses in the program ROM: the routine that waits for the next command
+    /// byte starts `jnb INT0 flag; mov a,38h; cjne a,37h` (`d2 97 e5 38 04 b5 37`), and the main
+    /// loop calls it then the dispatcher and jumps back (`lcall get; lcall ...; sjmp -8`).
+    pub fn probe(code: &[u8], pca020: bool) -> Option<Self> {
+        const SIG: [u8; 7] = [0xd2, 0x97, 0xe5, 0x38, 0x04, 0xb5, 0x37];
+        let get = code.windows(SIG.len()).position(|w| w == SIG)?;
+        let [hi, lo] = (get as u16).to_be_bytes();
+        let call = code.windows(8).position(|w| {
+            w[0] == 0x12 && w[1] == hi && w[2] == lo && w[3] == 0x12 && w[6] == 0x80 && w[7] == 0xf8
+        })?;
+        Some(Cfg {
+            pca020,
+            get_byte: get as u16,
+            idle_ret: (call + 3) as u16,
+        })
+    }
+}
+
 impl Board {
-    /// `code` = the 64 KiB program ROM (its first half is used), `data` = the data ROM(s).
+    /// `code` = the 64 KiB program ROM (its first half is used), `data` = the data ROM(s);
+    /// variant and addresses from the environment.
     pub fn new(code: Vec<u8>, data: Vec<u8>) -> Self {
+        Self::with_cfg(code, data, Cfg::from_env())
+    }
+
+    pub fn with_cfg(code: Vec<u8>, data: Vec<u8>, cfg: Cfg) -> Self {
         // the data ROM region is 1 MiB, a 256 KiB ROM repeated (PinMAME ROM_RELOAD)
         let mut d = Vec::with_capacity(0x100000);
         while d.len() < 0x100000 {
@@ -252,7 +296,7 @@ impl Board {
             sfr[(p & 0x7f) as usize] = 0xff;
         }
         sfr[(0x81 & 0x7f) as usize] = 0x07; // SP
-        let pca020 = std::env::var("ALVG_PCA020").is_ok_and(|v| v == "1");
+        let pca020 = cfg.pca020;
         let int1_clocks = if pca020 {
             INT1_CLOCKS_PCA020
         } else {
@@ -277,8 +321,8 @@ impl Board {
             clocks: 0,
             next_int1: int1_clocks,
             int1_clocks,
-            get_byte: env_hex("ALVG_GETBYTE", 0x0ae9),
-            idle_ret: env_hex("ALVG_IDLE_RET", 0x006a),
+            get_byte: cfg.get_byte,
+            idle_ret: cfg.idle_ret,
             on_frame: None,
         }
     }

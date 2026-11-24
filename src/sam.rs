@@ -7,7 +7,7 @@
 //! Only what the display needs is modelled: lamps, coils and sound writes are dropped.
 
 use arm32_cpu::{Cpu, Exception, Memory, Mode, reg};
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub const CLOCK_HZ: u64 = 40_000_000;
 /// FIQ (sound/IO tick) measured on a real machine.
@@ -58,7 +58,7 @@ const US_RXRDY: u32 = 1;
 
 #[derive(Clone)]
 pub struct Bus {
-    flash: Rc<Vec<u8>>,
+    flash: Arc<Vec<u8>>,
     pub page0: Vec<u8>,
     reset_ram: Vec<u8>,
     pub ram: Vec<u8>,
@@ -104,7 +104,7 @@ pub struct Bus {
 }
 
 impl Bus {
-    fn new(flash: Rc<Vec<u8>>) -> Bus {
+    fn new(flash: Arc<Vec<u8>>) -> Bus {
         let mut page0 = vec![0u8; 0x100000];
         let n = flash.len().min(0x100000);
         page0[..n].copy_from_slice(&flash[..n]);
@@ -764,7 +764,7 @@ pub struct Sam {
 }
 
 impl Sam {
-    pub fn new(rom: Rc<Vec<u8>>, name: &str) -> Sam {
+    pub fn new(rom: Arc<Vec<u8>>, name: &str) -> Sam {
         let mut bus = Bus::new(rom);
         bus.block_timers = name.starts_with("csi_") || name.starts_with("ij4_");
         Sam {
@@ -984,8 +984,211 @@ fn cond_met(cond: u32, cpsr: u32) -> bool {
     }
 }
 
+/// Display-effect API of a SAM program, found by signature (the OS is shared by every game,
+/// 2006-2014).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probe {
+    /// deff_start core: (id, a, b, 1).
+    pub start: u32,
+    /// RAM word holding the current task.
+    pub curtask: u32,
+    /// The effect count and its size in bytes (2 on 2006-2008 games, else 4).
+    pub nptr: u32,
+    pub nsize: u32,
+    /// u16 current effect id.
+    pub cur: u32,
+    /// task_sleep entry.
+    pub hook: u32,
+    /// Number of effects (ids 1..n-1), read from the ROM.
+    pub n: u32,
+}
+
+/// Find the display-effect API (port of the reference `samprobe.py`). The deff_start core
+/// checks the id (`cmp r0,r2; blo; mov r0,#err; bl; b; ldr r1,[pc]; lsl r2,r0,#3; ldr
+/// r3,[r2,r1]`, newer compilers drop the arg masking); its literal loads give CURTASK, NPTR and
+/// CUR; task_sleep is the `stmdb sp!,{lr}; ldr r1,[pc,#x]` (literal = CURTASK) before a
+/// `mov r0,#err; ldm sp!,{lr}; b error`.
+pub fn probe(flash: &[u8]) -> Option<Probe> {
+    let os = &flash[..flash.len().min(0x10_0000)];
+    let w32 = |a: usize| -> u32 {
+        os.get(a..a + 4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let lit = |a: usize| w32(a + 8 + (w32(a) & 0xfff) as usize);
+    // words with a mask of the bits that must match
+    let find = |pat: &[(u32, u32)]| -> Vec<usize> {
+        (0..os.len().saturating_sub(4 * pat.len()))
+            .step_by(4)
+            .filter(|&a| {
+                pat.iter()
+                    .enumerate()
+                    .all(|(k, &(v, m))| w32(a + 4 * k) & m == v)
+            })
+            .collect()
+    };
+    let core_sig = [
+        (0xe150_0002, !0),
+        (0x3a00_0002, !0),
+        (0xe3a0_0000, 0xffff_ff00),
+        (0xeb00_0000, 0xff00_0000),
+        (0xea00_0000, 0xff00_0000),
+        (0xe59f_1000, 0xffff_f000),
+        (0xe1a0_2180, !0),
+        (0xe792_3001, !0),
+    ];
+    let c = *find(&core_sig).first()?;
+    let core = (0..0x20)
+        .map(|k| c.wrapping_sub(4 * k))
+        .take_while(|&a| a <= c)
+        .find(|&a| w32(a) & 0xffff_4000 == 0xe92d_4000)?;
+    let (mut curtask, mut nptr, mut nsize, mut cur) = (None, None, 4, None);
+    for a in (core..core + 0x140).step_by(4) {
+        let (i, j, k) = (w32(a), w32(a + 4), w32(a + 8));
+        if i & 0xffff_f000 != 0xe59f_3000 {
+            continue;
+        }
+        if j == 0xe593_2000 && k == 0xe1a0_0003 && curtask.is_none() {
+            curtask = Some(lit(a));
+        } else if (j == 0xe593_2000 || j == 0xe1d3_20b0) && nptr.is_none() {
+            nptr = Some(lit(a));
+            if j == 0xe1d3_20b0 {
+                nsize = 2;
+            }
+        } else if j == 0xe1d3_10b0 && cur.is_none() {
+            cur = Some(lit(a));
+        }
+    }
+    let (curtask, nptr, cur) = (curtask?, nptr?, cur?);
+    let sleep_sig = [
+        (0xe3a0_0000, 0xffff_ff00),
+        (0xe8bd_4000, !0),
+        (0xea00_0000, 0xff00_0000),
+    ];
+    let mut hook = None;
+    'outer: for m in find(&sleep_sig) {
+        for k in 0..16 {
+            let Some(s) = m.checked_sub(4 * k) else { break };
+            if w32(s) == 0xe92d_4000 {
+                if w32(s + 4) & 0xffff_f000 == 0xe59f_1000 && lit(s + 4) == curtask {
+                    hook = Some(s as u32);
+                    break 'outer;
+                }
+                break;
+            }
+        }
+    }
+    let o = nptr.checked_sub(0x0400_0000)? as usize;
+    let b = flash.get(o..o + nsize as usize)?;
+    let n = if nsize == 2 {
+        u16::from_le_bytes([b[0], b[1]]) as u32
+    } else {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    };
+    Some(Probe {
+        start: core as u32,
+        curtask,
+        nptr,
+        nsize,
+        cur,
+        hook: hook?,
+        n,
+    })
+}
+
+/// How each display effect is played.
+#[derive(Clone, Copy, Debug)]
+pub struct DeffCfg {
+    pub hook: u32,
+    pub start: u32,
+    pub cur: u32,
+    /// Call only from a task that is not a display effect (its flags u16 at +2 lack `tflag`).
+    pub curtask: Option<u32>,
+    pub tflag: u16,
+    /// deff_start's arguments (b != 0 forces the effect over the running one).
+    pub a: u32,
+    pub b: u32,
+    /// Stop once the picture has not changed for this long while the effect runs.
+    pub hold_s: f64,
+    pub cap_s: f64,
+}
+
+impl DeffCfg {
+    pub fn from_probe(p: &Probe) -> Self {
+        DeffCfg {
+            hook: p.hook,
+            start: p.start,
+            cur: p.cur,
+            curtask: Some(p.curtask),
+            tflag: 4,
+            a: 0,
+            b: 1,
+            hold_s: 5.0,
+            cap_s: 40.0,
+        }
+    }
+}
+
+/// Boot the game for `boot_s` seconds (the attract snapshot every effect starts from).
+pub fn boot_for_deffs(rom: Arc<Vec<u8>>, name: &str, boot_s: f64) -> Sam {
+    let mut s0 = Sam::new(rom, name);
+    s0.run((boot_s * CLOCK_HZ as f64) as u64, &mut |_| {});
+    s0
+}
+
+/// Play one effect from the snapshot: call START(id, a, b, 1) from a task stopped at HOOK and
+/// record every picture flip until the current-effect word at CUR stops being the id (`end`),
+/// it never becomes the id (`none`), the picture holds (`hold`) or the cap (`cap`). Frames in
+/// ms since the call (the picture on screen before the call first). Also returns the call's r0.
+pub fn deff_one(s0: &Sam, id: u32, c: &DeffCfg) -> (crate::export::scenes::Scene, Option<u32>) {
+    let mut s = s0.clone();
+    s.record_flips = true;
+    let p = s.bus.picture();
+    s.flips.push((s.bus.cycles, p));
+    let (curtask, tflag) = (c.curtask, c.tflag);
+    let ok = move |s: &mut Sam| match curtask {
+        Some(ct) => {
+            let t = s.peek32(ct);
+            t == 0 || s.peek16(t + 2) & tflag == 0
+        }
+        None => true,
+    };
+    let r = s.call_at(c.hook, c.start, &[id, c.a, c.b, 1], CLOCK_HZ, &ok);
+    let t0 = s.bus.cycles;
+    let mut seen = false;
+    let mut kind = "cap";
+    while s.bus.cycles - t0 < (c.cap_s * CLOCK_HZ as f64) as u64 {
+        s.run(CLOCK_HZ / 100, &mut |_| {});
+        let v = s.peek16(c.cur) as u32;
+        if v == id {
+            seen = true;
+        } else if seen {
+            kind = "end";
+            break;
+        } else if s.bus.cycles - t0 > CLOCK_HZ / 2 {
+            kind = "none";
+            break;
+        }
+        let last = s.flips.last().map(|f| f.0).unwrap_or(t0).max(t0);
+        if seen && s.bus.cycles - last > (c.hold_s * CLOCK_HZ as f64) as u64 {
+            kind = "hold";
+            break;
+        }
+    }
+    let ms = |t: u64| t.saturating_sub(t0) / (CLOCK_HZ / 1000);
+    let frames = s.flips.iter().map(|(t, f)| (ms(*t), f.to_vec())).collect();
+    (
+        crate::export::scenes::Scene {
+            id,
+            kind: kind.into(),
+            frames,
+            extra: Default::default(),
+        },
+        r,
+    )
+}
+
 /// Load a SAM ROM: a .bin, or the first .bin inside a PinMAME .zip (via `unzip -p`).
-pub fn load_rom(path: &str) -> Rc<Vec<u8>> {
+pub fn load_rom(path: &str) -> Arc<Vec<u8>> {
     let data = if path.ends_with(".zip") {
         let out = std::process::Command::new("unzip")
             .args(["-p", path, "*.bin"])
@@ -995,7 +1198,7 @@ pub fn load_rom(path: &str) -> Rc<Vec<u8>> {
     } else {
         std::fs::read(path).expect("rom")
     };
-    Rc::new(data)
+    Arc::new(data)
 }
 
 fn rom_name(path: &str) -> String {
@@ -1054,91 +1257,84 @@ pub fn cli(args: &[String]) {
         // Env addresses in hex. Writes <outdir>/df_<id>.txt and prints one verdict line per id.
         "sam-deff" => {
             let env = |k: &str| std::env::var(k).ok();
-            let hex = |k: &str| u32::from_str_radix(&env(k).expect(k), 16).unwrap();
-            let (hook, start, cur) = (hex("HOOK"), hex("START"), hex("CUR"));
-            let a: u32 = env("A").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let b: u32 = env("B").and_then(|v| v.parse().ok()).unwrap_or(1);
-            let hold: f64 = env("HOLD").and_then(|v| v.parse().ok()).unwrap_or(5.0);
+            let hex = |k: &str| env(k).and_then(|v| u32::from_str_radix(&v, 16).ok());
+            let (Some(hook), Some(start), Some(cur)) = (hex("HOOK"), hex("START"), hex("CUR"))
+            else {
+                eprintln!("sam-deff needs HOOK, START and CUR (hex), e.g. from sam-probe");
+                std::process::exit(2);
+            };
+            let mut c = DeffCfg {
+                hook,
+                start,
+                cur,
+                curtask: hex("CURTASK"),
+                tflag: hex("TFLAG").map_or(4, |v| v as u16),
+                a: env("A").and_then(|v| v.parse().ok()).unwrap_or(0),
+                b: env("B").and_then(|v| v.parse().ok()).unwrap_or(1),
+                hold_s: env("HOLD").and_then(|v| v.parse().ok()).unwrap_or(5.0),
+                cap_s: args[5].parse().unwrap_or(40.0),
+            };
             let boot: f64 = env("BOOT").and_then(|v| v.parse().ok()).unwrap_or(30.0);
             let rom = load_rom(&args[2]);
-            let first: u32 = args[3].parse().unwrap();
-            let mut last: u32 = args[4].parse().unwrap();
-            let cap: f64 = args[5].parse().unwrap();
+            let first: u32 = args[3].parse().unwrap_or(1);
+            let mut last: u32 = args[4].parse().unwrap_or(1);
             let out = &args[6];
-            std::fs::create_dir_all(out).unwrap();
-            let mut s0 = Sam::new(rom, &rom_name(&args[2]));
-            s0.run((boot * CLOCK_HZ as f64) as u64, &mut |_| {});
+            if let Err(e) = std::fs::create_dir_all(out) {
+                eprintln!("{out}: {e}");
+                std::process::exit(1);
+            }
+            let s0 = boot_for_deffs(rom, &rom_name(&args[2]), boot);
             // NPTR: address of the effect count (ids are 1..count-1)
-            if let Some(np) = env("NPTR") {
-                let np = u32::from_str_radix(&np, 16).unwrap();
+            if let Some(np) = hex("NPTR") {
+                let mut s = s0.clone();
                 let n = if env("NSIZE").as_deref() == Some("2") {
-                    s0.peek16(np) as u32
+                    s.peek16(np) as u32
                 } else {
-                    s0.peek32(np)
+                    s.peek32(np)
                 };
                 eprintln!("effect count {n}");
                 last = last.min(n.saturating_sub(1));
             }
+            c.cap_s = c.cap_s.max(0.1);
             for id in first..=last {
-                let mut s = s0.clone();
-                s.record_flips = true;
-                // the picture on screen before the call
-                let p = s.bus.picture();
-                s.flips.push((s.bus.cycles, p));
-                // call from a task that is not a display effect itself (CURTASK = RAM word holding the
-                // current task, its flags u16 at +2, TFLAG = display-effect task flag)
-                let curtask = env("CURTASK").map(|v| u32::from_str_radix(&v, 16).unwrap());
-                let tflag: u16 = env("TFLAG")
-                    .map(|v| u16::from_str_radix(&v, 16).unwrap())
-                    .unwrap_or(4);
-                let ok = move |s: &mut Sam| match curtask {
-                    Some(ct) => {
-                        let t = s.peek32(ct);
-                        t == 0 || s.peek16(t + 2) & tflag == 0
-                    }
-                    None => true,
+                let (sc, ret) = deff_one(&s0, id, &c);
+                let fell = if sc.kind == "end" {
+                    sc.frames
+                        .last()
+                        .map_or("-".into(), |f| format!("{:.2}", f.0 as f64 / 1000.0))
+                } else {
+                    "-".into()
                 };
-                let r = s.call_at(hook, start, &[id, a, b, 1], CLOCK_HZ, &ok);
-                let t0 = s.bus.cycles;
-                let mut seen = false;
-                let mut kind = "cap";
-                let mut fell = None;
-                while s.bus.cycles - t0 < (cap * CLOCK_HZ as f64) as u64 {
-                    s.run(CLOCK_HZ / 100, &mut |_| {});
-                    let c = s.peek16(cur) as u32;
-                    if c == id {
-                        seen = true;
-                    } else if seen {
-                        kind = "end";
-                        fell = Some(s.bus.cycles);
-                        break;
-                    } else if s.bus.cycles - t0 > CLOCK_HZ / 2 {
-                        kind = "none";
-                        break;
-                    }
-                    // still the effect, but the picture has not changed for HOLD s (default 5)
-                    let last = s.flips.last().map(|f| f.0).unwrap_or(t0).max(t0);
-                    if seen && s.bus.cycles - last > (hold * CLOCK_HZ as f64) as u64 {
-                        kind = "hold";
-                        break;
-                    }
-                }
-                let ms = |t: u64| t.saturating_sub(t0) / (CLOCK_HZ / 1000);
                 println!(
-                    "{id:3} {kind:5} ret {:08x} end {} frames {}",
-                    r.unwrap_or(u32::MAX),
-                    fell.map(|t| format!("{:.2}", ms(t) as f64 / 1000.0))
-                        .unwrap_or("-".into()),
-                    s.flips.len()
+                    "{id:3} {:5} ret {:08x} end {fell} frames {}",
+                    sc.kind,
+                    ret.unwrap_or(u32::MAX),
+                    sc.frames.len()
                 );
-                let mut o = std::io::BufWriter::new(
-                    std::fs::File::create(format!("{out}/df_{id:03}.txt")).unwrap(),
-                );
-                for (t, f) in &s.flips {
-                    write_frame(&mut o, ms(*t), f);
+                let p = format!("{out}/df_{id:03}.txt");
+                let res = std::fs::File::create(&p).and_then(|f| {
+                    let mut o = std::io::BufWriter::new(f);
+                    for (t, f) in &sc.frames {
+                        let mut px = [0u8; 4096];
+                        px.copy_from_slice(&f[..4096]);
+                        write_frame(&mut o, *t, &px);
+                    }
+                    std::io::Write::flush(&mut o)
+                });
+                if let Err(e) = res {
+                    eprintln!("{p}: {e}");
+                    std::process::exit(1);
                 }
             }
         }
+        // sam-probe <rom>: the display-effect API addresses found by signature
+        "sam-probe" => match probe(&load_rom(&args[2])) {
+            Some(p) => println!("{p:x?}"),
+            None => {
+                eprintln!("no display-effect API found");
+                std::process::exit(1);
+            }
+        },
         // sam-dump <rom> <secs> <outprefix>: boot and save page 0 RAM, U13 RAM and NVRAM
         "sam-dump" => {
             let rom = load_rom(&args[2]);

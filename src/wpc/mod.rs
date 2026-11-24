@@ -422,9 +422,15 @@ pub fn load_rom(path: &str, member: Option<&str>) -> Result<Vec<u8>, String> {
             .map(|(_, v)| v)
             .ok_or_else(|| format!("{path}: no member {m}"));
     }
+    load_rom_files(&members).map_err(|e| format!("{path}: {e}"))
+}
+
+/// The U6 game ROM among a set's files: the one that carries a WPC game ID, else (older
+/// games such as T2 have none) one whose name ends in .rom or holds "u6".
+pub fn load_rom_files(members: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
     let names: Vec<&str> = members.iter().map(|(n, _)| n.as_str()).collect();
     let mut fallback = None;
-    for (n, v) in &members {
+    for (n, v) in members {
         if !matches!(v.len(), 0x20000 | 0x40000 | 0x80000 | 0x100000) {
             continue;
         }
@@ -436,13 +442,12 @@ pub fn load_rom(path: &str, member: Option<&str>) -> Result<Vec<u8>, String> {
         if find_game_id(v).is_some() {
             return Ok(v.clone());
         }
-        // older games (e.g. T2) have no game ID: the U6 name ends in .rom or holds "u6"
         let l = n.to_ascii_lowercase();
         if fallback.is_none() && (l.ends_with(".rom") || l.contains("u6")) {
             fallback = Some(v.clone());
         }
     }
-    fallback.ok_or_else(|| format!("{path}: no game ROM among {names:?} (use --member)"))
+    fallback.ok_or_else(|| format!("no game ROM among {names:?} (use --member)"))
 }
 
 /// One line per refresh: `index page data`, where data is the frame in hex, or `=` when it

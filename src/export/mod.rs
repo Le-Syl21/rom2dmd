@@ -26,8 +26,17 @@ pub struct Summary {
 
 /// Run `f` on every item on all cores; results in item order.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    par_map_threads(items, threads, f)
+}
+
+/// Run `f` on every item on `threads` threads; results in item order.
+pub fn par_map_threads<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Option<R>>> =
         items.iter().map(|_| std::sync::Mutex::new(None)).collect();

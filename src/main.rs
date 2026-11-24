@@ -1,10 +1,12 @@
 mod alvg;
+mod auto;
 mod capcom;
 mod de16;
 mod de32;
 mod de64;
 mod export;
 mod gts3;
+mod romset;
 mod sam;
 mod scan;
 mod wpc;
@@ -764,6 +766,28 @@ fn main() {
         }
         // wpc-*: Williams WPC CPU board, DMD generation (see wpc/mod.rs)
         Some(c) if c.starts_with("wpc-") => wpc::cli(&args),
-        _ => eprintln!("usage: rom2dmd de32-boot <dmd.rom> <secs> <out.txt>"),
+        // identify <rom.zip>...: family and addresses, no scan
+        Some("identify") => {
+            if let Err(e) = auto::identify_cli(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        // rom2dmd <rom.zip> <outdir>: the whole pipeline (see auto.rs)
+        Some(p) if std::path::Path::new(p).is_file() => {
+            if let Err(e) = auto::cli(&args) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        _ => {
+            eprintln!("{}", auto::USAGE);
+            eprintln!(
+                "debug subcommands: wpc-scan, wpc-probe, wpc-run, wpc-export, sam-probe, sam-deff, \
+                 sam-boot, cap-probe, cap-scan, cap-boot, de32-scan, de16-scan, de64-scan, \
+                 gts3-scan, alvg-scan, scene-export (see the source for their arguments)"
+            );
+            std::process::exit(2);
+        }
     }
 }

@@ -1420,38 +1420,31 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-/// `rom2dmd wpc-scan`: see `USAGE` and the module documentation.
-pub fn cli(args: &[String]) -> Result<(), String> {
-    if args.len() < 4 {
-        return Err(USAGE.into());
-    }
-    let (rom_path, outdir) = (&args[2], PathBuf::from(&args[3]));
-    let o = parse_opts(&args[4..])?;
-    let rom = super::load_rom(rom_path, o.member.as_deref())?;
-    let stem = Path::new(rom_path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let game = match &o.game {
-        Some(g) => Some(games::find(g).ok_or_else(|| format!("unknown game {g}"))?),
-        None => games::find(&stem),
-    };
-    let name = game
-        .as_ref()
-        .map(|g| g.name.clone())
-        .or(o.game.clone())
-        .unwrap_or(stem);
-    if game.is_none() {
-        eprintln!("warning: {name} is not in the game database: no switch names, no random play");
-    }
-    let (cfg, p) = configure(&rom, game.as_ref(), &name, &o)?;
+/// The three passes of a scan, each as its output chunks.
+pub struct ScanOutput {
+    /// Probe and boot report (the head of every chunk log).
+    pub header: String,
+    /// Verdict counts of the passes.
+    pub summary: String,
+    /// (`""`, `"byp"`, `"prot"`, chunks of results); raw logs are in each result's `raw_part`.
+    pub passes: Vec<(&'static str, Vec<Vec<IdResult>>)>,
+}
+
+/// Probe, boot and run the passes of `o.passes` for one game; each effect's raw log goes to
+/// a file in `parts` (see `IdResult::raw_part`).
+pub fn run_scan(
+    rom: Vec<u8>,
+    game: Option<&Game>,
+    name: &str,
+    o: &Opts,
+    parts: &Path,
+) -> Result<ScanOutput, String> {
+    let (cfg, p) = configure(&rom, game, name, o)?;
     let generation = o
         .generation
-        .or(game.as_ref().map(Game::generation))
+        .or(game.map(Game::generation))
         .unwrap_or(Generation::Dmd);
-    std::fs::create_dir_all(&outdir).map_err(|e| format!("{}: {e}", outdir.display()))?;
-    let parts = outdir.join(format!(".{name}_parts"));
-    std::fs::create_dir_all(&parts).map_err(|e| format!("{}: {e}", parts.display()))?;
+    std::fs::create_dir_all(parts).map_err(|e| format!("{}: {e}", parts.display()))?;
     let compat = if o.compat {
         Compat::wpc_emu()
     } else {
@@ -1492,101 +1485,155 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         .ids
         .clone()
         .unwrap_or_else(|| (0..cfg.nids as u32).collect());
-    let mut summary = header.clone();
-    let mut p1: Vec<IdResult> = Vec::new();
-    let mut p2: Vec<IdResult> = Vec::new();
+    let mut passes = Vec::new();
+    let mut p1: Vec<&IdResult> = Vec::new();
+    let r1;
     if o.passes.contains(&1) {
-        let r = run_pass(
+        let opts = PassOpts {
+            caps: o.caps,
+            bypass: false,
+            protect: false,
+        };
+        r1 = run_pass(
             &cfg,
             &snap,
             &after_boot,
             &contiguous(&ids),
-            PassOpts {
-                caps: o.caps,
-                bypass: false,
-                protect: false,
-            },
+            opts,
             o.threads,
-            &parts,
+            parts,
             "",
         )?;
-        write_chunks(&outdir, &name, "", &header, &r)?;
-        p1 = r.into_iter().flatten().collect();
+        p1 = r1.iter().flatten().collect();
+    } else {
+        r1 = Vec::new();
     }
     let refused: Vec<u32> = p1
         .iter()
         .filter(|r| r.kind == "refused")
         .map(|r| r.id)
         .collect();
-    if o.passes.contains(&2) && !refused.is_empty() {
-        let r = run_pass(
+    let r2 = if o.passes.contains(&2) && !refused.is_empty() {
+        let opts = PassOpts {
+            caps: o.caps,
+            bypass: true,
+            protect: true,
+        };
+        run_pass(
             &cfg,
             &snap,
             &fresh,
             &dealt(&refused),
-            PassOpts {
-                caps: o.caps,
-                bypass: true,
-                protect: true,
-            },
+            opts,
             o.threads,
-            &parts,
+            parts,
             "byp",
-        )?;
-        write_chunks(&outdir, &name, "byp", &header, &r)?;
-        p2 = r.into_iter().flatten().collect();
-    }
+        )?
+    } else {
+        Vec::new()
+    };
     let mut cut: Vec<u32> = p1
         .iter()
-        .chain(&p2)
+        .copied()
+        .chain(r2.iter().flatten())
         .filter(|r| r.killer_other)
         .map(|r| r.id)
         .collect();
     cut.sort_unstable();
     cut.dedup();
-    let mut p3: Vec<IdResult> = Vec::new();
-    if o.passes.contains(&3) && !cut.is_empty() {
-        let r = run_pass(
+    let r3 = if o.passes.contains(&3) && !cut.is_empty() {
+        let opts = PassOpts {
+            caps: o.caps3,
+            bypass: true,
+            protect: true,
+        };
+        run_pass(
             &cfg,
             &snap,
             &fresh,
             &dealt(&cut),
-            PassOpts {
-                caps: o.caps3,
-                bypass: true,
-                protect: true,
-            },
+            opts,
             o.threads,
-            &parts,
+            parts,
             "prot",
-        )?;
-        write_chunks(&outdir, &name, "prot", &header, &r)?;
-        p3 = r.into_iter().flatten().collect();
-    }
-    let _ = std::fs::remove_dir(&parts);
+        )?
+    } else {
+        Vec::new()
+    };
     // verdict counts of a pass
-    let count = |v: &[IdResult]| {
+    let count = |v: &[Vec<IdResult>]| {
         let mut k: HashMap<&str, usize> = HashMap::new();
-        for r in v {
+        for r in v.iter().flatten() {
             *k.entry(r.kind).or_default() += 1;
         }
         let mut k: Vec<_> = k.into_iter().collect();
         k.sort();
         k
     };
+    let n = |v: &[Vec<IdResult>]| v.iter().map(Vec::len).sum::<usize>();
+    let mut summary = header.clone();
     let _ = writeln!(
         summary,
         "pass 1: {} effects {:?}\npass 2 (refused, bypassed): {} {:?} {refused:?}\npass 3 (cut, protected): {} {:?} {cut:?}",
-        p1.len(),
-        count(&p1),
-        p2.len(),
-        count(&p2),
-        p3.len(),
-        count(&p3)
+        n(&r1),
+        count(&r1),
+        n(&r2),
+        count(&r2),
+        n(&r3),
+        count(&r3)
     );
+    for (tag, r) in [("", r1), ("byp", r2), ("prot", r3)] {
+        if !r.is_empty() {
+            passes.push((tag, r));
+        }
+    }
+    Ok(ScanOutput {
+        header,
+        summary,
+        passes,
+    })
+}
+
+/// The game database entry and display name for a ROM (or `--game`).
+pub fn resolve_game(stem: &str, forced: Option<&str>) -> Result<(Option<Game>, String), String> {
+    let game = match forced {
+        Some(g) => Some(games::find(g).ok_or_else(|| format!("unknown game {g}"))?),
+        None => games::find(stem),
+    };
+    let name = game
+        .as_ref()
+        .map(|g| g.name.clone())
+        .or(forced.map(str::to_string))
+        .unwrap_or_else(|| stem.to_string());
+    Ok((game, name))
+}
+
+/// `rom2dmd wpc-scan`: see `USAGE` and the module documentation.
+pub fn cli(args: &[String]) -> Result<(), String> {
+    if args.len() < 4 {
+        return Err(USAGE.into());
+    }
+    let (rom_path, outdir) = (&args[2], PathBuf::from(&args[3]));
+    let o = parse_opts(&args[4..])?;
+    let rom = super::load_rom(rom_path, o.member.as_deref())?;
+    let stem = Path::new(rom_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (game, name) = resolve_game(&stem, o.game.as_deref())?;
+    if game.is_none() {
+        eprintln!("warning: {name} is not in the game database: no switch names, no random play");
+    }
+    std::fs::create_dir_all(&outdir).map_err(|e| format!("{}: {e}", outdir.display()))?;
+    let parts = outdir.join(format!(".{name}_parts"));
+    let out = run_scan(rom, game.as_ref(), &name, &o, &parts)?;
+    for (tag, r) in &out.passes {
+        write_chunks(&outdir, &name, tag, &out.header, r)?;
+    }
+    let _ = std::fs::remove_dir(&parts);
     let sp = outdir.join(format!("{name}.scan.txt"));
-    std::fs::write(&sp, &summary).map_err(|e| format!("{}: {e}", sp.display()))?;
-    eprint!("{summary}");
+    std::fs::write(&sp, &out.summary).map_err(|e| format!("{}: {e}", sp.display()))?;
+    eprint!("{}", out.summary);
     Ok(())
 }
 

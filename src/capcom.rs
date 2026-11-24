@@ -1211,6 +1211,421 @@ pub fn cli(args: &[String]) {
                 b.step();
             }
         }
+        // cap-probe <rom.zip>: the display manager found in the ROM, and the scene list
+        "cap-probe" => {
+            let res = crate::romset::read_zip(std::path::Path::new(&args[2])).and_then(|files| {
+                let set = std::path::Path::new(&args[2])
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                probe(&image(&files, &set)).ok_or_else(|| "DM_ADD not found".to_string())
+            });
+            match res {
+                Ok(p) => {
+                    println!(
+                        "DM_ADD {:08x} {:?} layout {:?}",
+                        p.dmadd, p.running, p.layout
+                    );
+                    for (n, (f, a)) in p.scenes.iter().enumerate() {
+                        let a: Vec<String> = a
+                            .iter()
+                            .map(|x| x.map_or("?".into(), |v| format!("{v:#x}")))
+                            .collect();
+                        println!("{n} {f:#x} {}", a.join(" "));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => eprintln!("unknown cap subcommand"),
+    }
+}
+
+/// The CPU ROM space from the set's files (name, contents): `u<n>h*`/`u<n>l*` pairs (even /
+/// odd bytes) or `u<n>hu<n>l*` files already interleaved, pair n at (n - 1) * 0x400000.
+/// Flipper Football loads U4 before U3 (pair 4 at 0x800000, pair 3 at 0xc00000).
+pub fn image(files: &[(String, Vec<u8>)], set: &str) -> Vec<u8> {
+    let swap34 = set.to_lowercase().starts_with("ffv");
+    let mut rom = vec![0xffu8; 0x100_0000];
+    let mut top = 0;
+    for n in 1..=4usize {
+        let (mut hi, mut lo, mut both) = (None, None, None);
+        for (name, d) in files {
+            let name = name.to_lowercase();
+            if name.starts_with(&format!("u{n}hu{n}l")) {
+                both = Some(d);
+            } else if name.starts_with(&format!("u{n}h")) || name.starts_with(&format!("bsu{n}h")) {
+                hi = Some(d);
+            } else if name.starts_with(&format!("u{n}l")) || name.starts_with(&format!("bsu{n}l")) {
+                lo = Some(d);
+            }
+        }
+        let slot = match n {
+            3 if swap34 => 4,
+            4 if swap34 => 3,
+            n => n,
+        };
+        let base = (slot - 1) * 0x40_0000;
+        if let Some(d) = both {
+            let end = (base + d.len()).min(rom.len());
+            rom[base..end].copy_from_slice(&d[..end - base]);
+            top = top.max(end);
+        } else if let (Some(h), Some(l)) = (hi, lo) {
+            for (i, (a, b)) in h.iter().zip(l.iter()).enumerate() {
+                if base + 2 * i + 1 >= rom.len() {
+                    break;
+                }
+                rom[base + 2 * i] = *a;
+                rom[base + 2 * i + 1] = *b;
+            }
+            top = top.max((base + 2 * h.len()).min(rom.len()));
+        }
+    }
+    rom.truncate(top);
+    rom
+}
+
+/// Whether `set` has a hardware entry (display width, switch board).
+pub fn known_set(set: &str) -> bool {
+    let s = set.to_lowercase();
+    GAMES.iter().any(|g| s.starts_with(g.0))
+}
+
+/// A board for `set` (its GAMES entry) on the given ROM image and NVRAM contents.
+pub fn board_for_set(rom: Vec<u8>, set: &str, nvram: Option<&[u8]>) -> Result<Board, String> {
+    let s = set.to_lowercase();
+    let g = GAMES
+        .iter()
+        .find(|g| s.starts_with(g.0))
+        .ok_or_else(|| format!("Capcom set {set} has no hardware entry"))?;
+    if rom.len() < 0x100 {
+        return Err(format!("Capcom set {set}: ROM image too small"));
+    }
+    let mut b = Board::new(rom, g.1, g.2, g.3);
+    if let Some(d) = nvram {
+        let n = d.len().min(b.bus.nvram.len());
+        b.bus.nvram[..n].copy_from_slice(&d[..n]);
+    }
+    Ok(b)
+}
+
+/// Seconds of the first boot on a fresh NVRAM: long enough to get past the "NON-VOLATILE RAM
+/// CORRUPTED" message (Big Bang Bar then shows "4 BALLS MISSING" for a while).
+pub fn nvram_boot_s(set: &str) -> f64 {
+    if set.to_lowercase().starts_with("bbb") {
+        120.0
+    } else {
+        40.0
+    }
+}
+
+/// How the display manager knows a scene still runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Running {
+    /// RAM address of the current entry's function.
+    Cur(u32),
+    /// `base, size, count, state offset`: a slot holds the function with a non-zero state.
+    Slots([u32; 4]),
+}
+
+/// The display manager of a Capcom program, found in the ROM (see `probe`).
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub dmadd: u32,
+    pub running: Running,
+    /// Argument sizes in call order (true = long), with forced values (the priority).
+    pub layout: Vec<(bool, Option<u32>)>,
+    /// Scenes: one per distinct DM_ADD function (by address), the arguments of its first call
+    /// site (None = not a constant push, the natural call's value is kept).
+    pub scenes: Vec<(u32, Vec<Option<i64>>)>,
+}
+
+const BASE: u32 = 0x1000_0000;
+
+fn be16(b: &[u8], i: usize) -> Option<u16> {
+    b.get(i..i + 2).map(|x| u16::from_be_bytes([x[0], x[1]]))
+}
+
+fn be32(b: &[u8], i: usize) -> Option<u32> {
+    b.get(i..i + 4)
+        .map(|x| u32::from_be_bytes([x[0], x[1], x[2], x[3]]))
+}
+
+/// Start of the function holding offset `at`: the nearest `movem.l ...,-(SP)` or `link A6`.
+fn func_start(rom: &[u8], at: usize) -> Option<usize> {
+    (0..0x100)
+        .map(|k| at.checked_sub(2 * k))
+        .take_while(Option::is_some)
+        .flatten()
+        .find(|&i| matches!(be16(rom, i), Some(0x48e7 | 0x4e56)))
+}
+
+/// Find DM_ADD, the running test, the argument layout and the scenes (ports of the reference
+/// `finddm.py`, `rawdm.py` and `mkscenes2.py` on the raw image).
+///
+/// - Older games (Pinball Magic to Big Bang Bar) assert "DISPMGR.C / DM_ADD": DM_ADD is the
+///   function pushing the "DM_ADD" string; it calls (bsr.w) the entry-swap routine, which
+///   starts `lea (-0x10,SP),SP` and copies the current entry from fixed RAM, its function
+///   first (`move.l (abs).l,(SP)`). Calls `DM_ADD(fn, cb, id.w, prio.w, dur.l)`.
+/// - Kingpin and Flipper Football have no strings: DM_ADD checks `1 <= prio <= 15` (`cmpi.w
+///   #1,D7; blt; cmpi.w #$f,D7; ble`) and masks flags with `#$7fff`; the manager runs 16 slots
+///   of 0x52 bytes indexed by `n * 0x52 + base` (`lsl #2; add; lsl #3; add; add D0,D0;
+///   addi.l #base`), state at +0x2a. Calls `DM_ADD(fn, arg, cb, prio.w, id.w, dur.l, flags.w)`.
+pub fn probe(rom: &[u8]) -> Option<Probe> {
+    let find = |pat: &[u8]| rom.windows(pat.len()).position(|w| w == pat);
+    let (dmadd, running, layout) = if let Some(s) = find(b"DM_ADD\0") {
+        let mut pea = vec![0x48, 0x79];
+        pea.extend_from_slice(&(BASE + s as u32).to_be_bytes());
+        let at = find(&pea)?;
+        let f = func_start(rom, at)?;
+        let mut cur = None;
+        for i in (f..(f + 0x400).min(rom.len())).step_by(2) {
+            if be16(rom, i) != Some(0x6100) {
+                continue;
+            }
+            let t = (i as i64 + 2 + be16(rom, i + 2)? as i16 as i64) as usize;
+            if be32(rom, t) != Some(0x4fef_fff0) {
+                continue;
+            }
+            if let Some(j) = (t..t + 16)
+                .step_by(2)
+                .find(|&j| be16(rom, j) == Some(0x2eb9))
+            {
+                cur = be32(rom, j + 2);
+                break;
+            }
+        }
+        let l5 = vec![
+            (true, None),
+            (true, None),
+            (false, None),
+            (false, Some(8)),
+            (true, None),
+        ];
+        (BASE + f as u32, Running::Cur(cur?), l5)
+    } else {
+        let sig = [0x0c, 0x47, 0x00, 0x01, 0x6d];
+        let at = (0..rom.len().saturating_sub(16)).find(|&i| {
+            rom[i..i + 5] == sig
+                && rom[i + 6..i + 10] == [0x0c, 0x47, 0x00, 0x0f]
+                && rom[i + 10] == 0x6f
+                && rom[i..(i + 0x60).min(rom.len())]
+                    .windows(4)
+                    .any(|w| w == [0x30, 0x3c, 0x7f, 0xff])
+        })?;
+        let f = func_start(rom, at)?;
+        // the slot table base: the most common `n * 0x52 + base`
+        let idx = [
+            0xe5, 0x88, 0xd0, 0x87, 0xe7, 0x88, 0xd0, 0x87, 0xd0, 0x80, 0x06, 0x80,
+        ];
+        let mut bases: Vec<(u32, usize)> = Vec::new();
+        for i in 0..rom.len().saturating_sub(idx.len() + 4) {
+            if rom[i..i + idx.len()] == idx
+                && let Some(b) = be32(rom, i + idx.len())
+            {
+                match bases.iter_mut().find(|x| x.0 == b) {
+                    Some(x) => x.1 += 1,
+                    None => bases.push((b, 1)),
+                }
+            }
+        }
+        let base = bases.iter().max_by_key(|x| x.1)?.0;
+        let l7 = vec![
+            (true, None),
+            (true, None),
+            (true, None),
+            (false, Some(0xf)),
+            (false, None),
+            (true, None),
+            (false, None),
+        ];
+        (
+            BASE + f as u32,
+            Running::Slots([base, 0x52, 0x10, 0x2a]),
+            l7,
+        )
+    };
+    let sites = call_sites(rom, dmadd, layout.len());
+    let mut scenes: Vec<(u32, Vec<Option<i64>>)> = Vec::new();
+    for (func, args) in sites {
+        if !scenes.iter().any(|s| s.0 == func) {
+            scenes.push((func, args));
+        }
+    }
+    scenes.sort_by_key(|s| s.0);
+    Some(Probe {
+        dmadd,
+        running,
+        layout,
+        scenes,
+    })
+}
+
+/// DM_ADD call sites in the raw image: `pea fn.l` right before `jsr DM_ADD.l`, or `jsr (An)`
+/// with An loaded with DM_ADD shortly before; then the pushes before it decoded backwards.
+/// Returns (fn, arguments after fn in call order; None when not a constant push).
+fn call_sites(rom: &[u8], dm: u32, nargs: usize) -> Vec<(u32, Vec<Option<i64>>)> {
+    let n = rom.len();
+    let w = |i: usize| be16(rom, i).map_or(-1, |v| v as i64);
+    let l = |i: usize| be32(rom, i).map_or(-1, |v| v as i64);
+    // the push instruction starting at i and ending at end: Some(value) / Some(None) = unknown
+    let push_at = |i: usize, end: usize| -> Option<Option<i64>> {
+        let len = end - i;
+        let op = w(i);
+        let sx = |v: i64| if v & 0x8000 != 0 { v - 0x10000 } else { v };
+        match (len, op) {
+            (6, 0x4879) | (6, 0x2f3c) => Some(Some(l(i + 2))),
+            (4, 0x4878) => Some(Some(sx(w(i + 2)))),
+            (4, 0x3f3c) => Some(Some(w(i + 2))),
+            (2, 0x42a7) | (2, 0x4267) => Some(Some(0)),
+            (2, o) if o & 0xfff0 == 0x2f00 || o & 0xfff8 == 0x3f00 => Some(None),
+            (4, o) if o & 0xfff8 == 0x2f28 || o & 0xfff8 == 0x3f28 => Some(None),
+            (6, 0x2f39) | (6, 0x3f39) => Some(None),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 6 < n {
+        if w(i) != 0x4879 {
+            i += 2;
+            continue;
+        }
+        let f = l(i + 2);
+        let in_rom = f >= BASE as i64 && f < BASE as i64 + n as i64 && f & 1 == 0;
+        let j = i + 6;
+        let ok = in_rom
+            && ((w(j) == 0x4eb9 && l(j + 2) == dm as i64)
+                || (w(j) & 0xfff8 == 0x4e90 && {
+                    let r = w(j) & 7;
+                    (1..2000)
+                        .map(|k| j.checked_sub(2 * k))
+                        .take_while(Option::is_some)
+                        .flatten()
+                        .any(|k| w(k) == (0x207c | r << 9) && l(k + 2) == dm as i64)
+                }));
+        if ok {
+            let mut args = Vec::new();
+            let mut end = i;
+            for _ in 0..nargs - 1 {
+                let got = [2usize, 4, 6].iter().find_map(|&m| {
+                    end.checked_sub(m)
+                        .and_then(|s| push_at(s, end).map(|v| (m, v)))
+                });
+                match got {
+                    Some((m, v)) => {
+                        end -= m;
+                        args.push(v);
+                    }
+                    None => {
+                        args.push(None);
+                        break;
+                    }
+                }
+            }
+            out.push((f as u32, args));
+        }
+        i += 2;
+    }
+    out
+}
+
+/// Play one scene on `b` (booted from the scan NVRAM): run `boot_s`, stop at the next natural
+/// DM_ADD, overwrite its stacked arguments with the scene's, then record every new picture
+/// until the manager no longer runs the scene's function (`end`; a little of what follows is
+/// cut), it never runs it (`nostart`) or the cap.
+pub fn scan_scene(
+    mut b: Board,
+    n: u32,
+    scene: &(u32, Vec<Option<i64>>),
+    p: &Probe,
+    boot_s: f64,
+    cap_s: f64,
+) -> crate::export::scenes::Scene {
+    let frames: std::rc::Rc<std::cell::RefCell<Recorded>> = Default::default();
+    let fr = frames.clone();
+    b.on_frame = Some(Box::new(move |t, f| {
+        let mut v = fr.borrow_mut();
+        if v.last().map(|l| l.1.as_slice() != f).unwrap_or(true) {
+            v.push((t, f.to_vec()));
+        }
+    }));
+    b.run((boot_s * CLOCK_HZ as f64) as u64);
+    let limit = b.cycles + 60 * CLOCK_HZ;
+    while b.cpu.pc != p.dmadd && b.cycles < limit {
+        b.step();
+    }
+    let func = scene.0;
+    let mut a = b.cpu.dar[15] + 4;
+    for (k, (long, force)) in p.layout.iter().enumerate() {
+        let v = force.map(|v| v as i64).or_else(|| {
+            if k == 0 {
+                Some(func as i64)
+            } else {
+                scene.1.get(k - 1).copied().flatten()
+            }
+        });
+        if let Some(v) = v {
+            if *long {
+                b.bus.write_long(a, v as u32);
+            } else {
+                b.bus.write_word(a, v as u16);
+            }
+        }
+        a += if *long { 4 } else { 2 };
+    }
+    {
+        let mut v = frames.borrow_mut();
+        let keep = v.pop();
+        v.clear();
+        v.extend(keep);
+    }
+    let t0 = b.cycles;
+    let (mut started, mut ended, mut kind) = (false, None, "cap");
+    while b.cycles - t0 < (cap_s * CLOCK_HZ as f64) as u64 {
+        b.run(CLOCK_HZ / 1000);
+        let running = match p.running {
+            Running::Cur(cur) => b.bus.read_long(cur) == func,
+            Running::Slots([base, size, count, state]) => (0..count).any(|k| {
+                let a = base + k * size;
+                b.bus.read_long(a) == func && b.bus.read_word(a + state) != 0
+            }),
+        };
+        if running {
+            started = true;
+        } else if started && ended.is_none() {
+            ended = Some(b.cycles);
+            kind = "end";
+        }
+        if let Some(e) = ended
+            && b.cycles - e > CLOCK_HZ / 5
+        {
+            break;
+        }
+        if !started && b.cycles - t0 > 2 * CLOCK_HZ {
+            kind = "nostart";
+            break;
+        }
+    }
+    let f = std::mem::take(&mut *frames.borrow_mut());
+    let frames = f
+        .into_iter()
+        .take_while(|(t, _)| !(ended.is_some_and(|e| *t > e) || (kind == "nostart" && *t > t0)))
+        .map(|(t, px)| (t.saturating_sub(t0) * 1000 / CLOCK_HZ, px))
+        .collect();
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "dm_function".into(),
+        serde_json::json!(format!("{func:08x}")),
+    );
+    extra.insert("scene".into(), serde_json::json!(n));
+    crate::export::scenes::Scene {
+        id: n,
+        kind: kind.into(),
+        frames,
+        extra,
     }
 }
