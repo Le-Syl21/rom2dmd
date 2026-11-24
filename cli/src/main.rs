@@ -107,6 +107,7 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--version" | "-V") => println!("rom2dmd {}", env!("CARGO_PKG_VERSION")),
         // de32-boot <dmd.rom> <secs> <out.txt>: run the board alone, no command.
         Some("de32-boot") => {
             let rom = std::fs::read(&args[2]).expect("rom");
