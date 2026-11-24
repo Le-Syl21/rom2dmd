@@ -4,9 +4,12 @@
 //!
 //! The picture on screen when a command arrives (the resting screen: the most common first
 //! picture of all scenes) belongs to no scene and is dropped from their start, also when only
-//! half redrawn. With `blend` (Gottlieb's temporal combiner) the mixtures of the resting
-//! screen at both ends of a scene are dropped too, and a single still picture shared by 5 or
-//! more ids is the picture under the score layer that an ignored command leaves (`none`).
+//! half redrawn, and so are the other phases of an animated resting screen (the same dots in
+//! other shades, in the first 0.1 s of at least half the scenes at the same time). With `blend`
+//! (Gottlieb's temporal combiner) the mixtures of the resting screen at both ends of a scene are
+//! dropped too, and a single still picture shared by 5 or more ids is the picture under the
+//! score layer that an ignored command leaves (`none`). An ended scene also loses the black or
+//! resting pictures it ends on (the board clearing the screen, the boot picture coming back).
 //!
 //! Verdicts: `end` (the scene ended), `loop` (ran to the cap and repeats: `cycle_from_s`,
 //! `cycle_s`), `hold` (ran to the cap on one picture), `running` (ran to the cap, not
@@ -73,6 +76,35 @@ pub fn export(scenes: &[Scene], o: &Opts, outdir: &Path) -> Result<Summary, Stri
             (rest, best) = (Some(*p), *n);
         }
     }
+    // An animated resting screen (Baywatch's shimmering title) shows a second phase before the
+    // scene starts. The boot is the same for every id, so that phase comes at the same time in
+    // each scene: a picture of the first 0.1 s (before the board answers the command) found in
+    // at least half the scenes at the same time, lighting the same dots as the resting screen in
+    // other shades, is resting too.
+    let mut openers: Vec<(u64, &[u8], usize)> = Vec::new();
+    for s in scenes {
+        let start = s.frames.first().map_or(0, |f| f.0);
+        for f in s.frames.iter().take(3).filter(|f| f.0 - start < 100) {
+            match openers
+                .iter_mut()
+                .find(|x| x.0 == f.0 && x.1 == f.1.as_slice())
+            {
+                Some(x) => x.2 += 1,
+                None => openers.push((f.0, &f.1, 1)),
+            }
+        }
+    }
+    let with_frames = scenes.iter().filter(|s| !s.frames.is_empty()).count();
+    let same_dots = |p: &[u8]| {
+        rest.is_some_and(|r| {
+            r.len() == p.len() && r.iter().zip(p).all(|(a, b)| (*a == 0) == (*b == 0))
+        })
+    };
+    let resting: Vec<(u64, &[u8])> = openers
+        .iter()
+        .filter(|x| x.2 >= 2 && 2 * x.2 >= with_frames && same_dots(x.1))
+        .map(|x| (x.0, x.1))
+        .collect();
     let rest_lit: Vec<usize> = rest.map_or(Vec::new(), |r| {
         (0..r.len()).filter(|&i| r[i] != 0).collect()
     });
@@ -111,10 +143,16 @@ pub fn export(scenes: &[Scene], o: &Opts, outdir: &Path) -> Result<Summary, Stri
             .map(|f| (f.0 as f64 / 1000.0, f.1.as_slice()))
             .collect();
         let t0 = fr.first().map_or(0.0, |f| f.0);
-        while fr.len() > 1 && half_rest(fr[0].1) {
+        let resting_pic = |f: &Pic| {
+            half_rest(f.1)
+                || resting
+                    .iter()
+                    .any(|r| r.1 == f.1 && r.0 as f64 == (f.0 * 1000.0).round())
+        };
+        while fr.len() > 1 && resting_pic(&fr[0]) {
             fr.remove(0);
         }
-        if fr.len() == 1 && half_rest(fr[0].1) {
+        if fr.len() == 1 && resting_pic(&fr[0]) {
             fr.clear();
         }
         if o.blend && rest.is_some() {
@@ -136,6 +174,24 @@ pub fn export(scenes: &[Scene], o: &Opts, outdir: &Path) -> Result<Summary, Stri
             && z.0 - a.0 < 0.1
             && z.1.iter().all(|&v| v == 0)
         {
+            fr.clear();
+        }
+        // An ended scene hands the screen back: the black or resting pictures it ends on (the
+        // board clearing the screen, the boot picture coming back) are not part of it.
+        if s.kind == "end" {
+            while fr.len() > 1
+                && fr.last().is_some_and(|f| {
+                    f.1.iter().all(|&v| v == 0)
+                        || Some(f.1) == rest
+                        || resting.iter().any(|r| r.1 == f.1)
+                })
+            {
+                fr.pop();
+            }
+        }
+        // only the resting screen, still or shimmering (its dots in any shades): the command
+        // did nothing
+        if !resting.is_empty() && fr.iter().all(|f| same_dots(f.1)) {
             fr.clear();
         }
         let mut rec = Map::new();
@@ -321,8 +377,11 @@ pub fn read_dumps(dir: &Path, log: &Path) -> Result<Vec<Scene>, String> {
 mod tests {
     use super::*;
 
+    /// A picture whose lit dots depend on `v` (every (v+1)th dot, in shade v)
     fn pic(v: u8) -> Vec<u8> {
-        vec![v; 128 * 32]
+        (0..128 * 32)
+            .map(|i| if i % (v as usize + 1) == 0 { v } else { 0 })
+            .collect()
     }
 
     #[test]
@@ -353,6 +412,32 @@ mod tests {
         assert_eq!(s.counts.get("none"), Some(&1));
         assert!(dir.join("scene_000/frames/f0001.png").exists());
         assert!(!dir.join("scene_000/frames/f0002.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn animated_resting_screen_dropped() {
+        // the resting screen shimmers: phase b lights the same dots in another shade
+        let (a, mut b) = (pic(1), pic(1));
+        b[4] = 3;
+        let scenes: Vec<Scene> = (0..3)
+            .map(|id| Scene {
+                id,
+                kind: "end".into(),
+                frames: vec![(0, a.clone()), (24, b.clone()), (100, pic(5 + id as u8))],
+                extra: Map::new(),
+            })
+            .collect();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/scenes-test-anim");
+        let o = Opts {
+            geometry: Geometry::linear(128, 32, 4),
+            blend: false,
+        };
+        let s = export(&scenes, &o, &dir).expect("export");
+        assert_eq!(s.counts.get("end"), Some(&3));
+        assert!(dir.join("scene_000/frames/f0000.png").exists());
+        assert!(!dir.join("scene_000/frames/f0001.png").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
