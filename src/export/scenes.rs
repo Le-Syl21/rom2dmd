@@ -1,0 +1,358 @@
+//! Scene export of the boards whose scans record finished pictures (Data East, Whitestar, Sega
+//! 192x64, Gottlieb System 3, Alvin G., Capcom, Stern SAM): port of the reference
+//! `de_export.py` / `sam_export.py`.
+//!
+//! The picture on screen when a command arrives (the resting screen: the most common first
+//! picture of all scenes) belongs to no scene and is dropped from their start, also when only
+//! half redrawn. With `blend` (Gottlieb's temporal combiner) the mixtures of the resting
+//! screen at both ends of a scene are dropped too, and a single still picture shared by 5 or
+//! more ids is the picture under the score layer that an ignored command leaves (`none`).
+//!
+//! Verdicts: `end` (the scene ended), `loop` (ran to the cap and repeats: `cycle_from_s`,
+//! `cycle_s`), `hold` (ran to the cap on one picture), `running` (ran to the cap, not
+//! periodic), `blank` (only black), `none` (the command did nothing).
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+
+use serde_json::{Map, Value, json};
+
+use super::{Geometry, Periodic, Summary, io_err, periodicity, round_to, sample_20hz};
+
+/// What a scan recorded for one scene id.
+#[derive(Clone, Debug, Default)]
+pub struct Scene {
+    pub id: u32,
+    /// The scan's verdict: `end` when the scene ended, anything else when it ran to the cap
+    /// (`none`: the command was not taken).
+    pub kind: String,
+    /// (milliseconds since the command, levels), consecutive duplicates removed.
+    pub frames: Vec<(u64, Vec<u8>)>,
+    /// Extra manifest fields (e.g. the display-manager function of a Capcom scene).
+    pub extra: Map<String, Value>,
+}
+
+/// Export options.
+#[derive(Clone, Debug)]
+pub struct Opts {
+    pub geometry: Geometry,
+    /// Gottlieb combiner clean-up (see the module documentation).
+    pub blend: bool,
+}
+
+type Pic<'a> = (f64, &'a [u8]);
+
+/// Write `outdir/scene_NNN/` and `outdir/manifest.json`.
+pub fn export(scenes: &[Scene], o: &Opts, outdir: &Path) -> Result<Summary, String> {
+    let mut g = o.geometry.clone();
+    let top = scenes
+        .iter()
+        .flat_map(|s| s.frames.iter())
+        .flat_map(|f| f.1.iter())
+        .copied()
+        .max()
+        .unwrap_or(0) as usize;
+    if top >= g.palette.len() {
+        g = Geometry::linear(g.width, g.height, top + 1);
+    }
+    let (w, dots) = (g.width, g.width * g.height);
+    // the resting screen: the most common first picture (first seen wins a tie)
+    let mut firsts: Vec<(&[u8], usize)> = Vec::new();
+    for s in scenes {
+        if let Some(f) = s.frames.first() {
+            match firsts.iter_mut().find(|x| x.0 == f.1.as_slice()) {
+                Some(x) => x.1 += 1,
+                None => firsts.push((&f.1, 1)),
+            }
+        }
+    }
+    let mut rest: Option<&[u8]> = None;
+    let mut best = 0;
+    for (p, n) in &firsts {
+        if *n > best {
+            (rest, best) = (Some(*p), *n);
+        }
+    }
+    let rest_lit: Vec<usize> = rest.map_or(Vec::new(), |r| {
+        (0..r.len()).filter(|&i| r[i] != 0).collect()
+    });
+    // a picture still carrying most of the resting screen's dots (plus others): a mixture
+    let blend_of_rest = |img: &[u8]| -> bool {
+        let Some(r) = rest else { return false };
+        if rest_lit.is_empty() || img == r {
+            return false;
+        }
+        let kept = rest_lit.iter().filter(|&&i| img[i] != 0).count();
+        let extra = (0..img.len()).filter(|&i| img[i] != 0 && r[i] == 0).count();
+        (extra == 0 && kept > 0) || (kept as f64 >= 0.8 * rest_lit.len() as f64 && extra > 0)
+    };
+    // also a picture still half the resting one (the 128x16 board redraws one half at a time)
+    let half_rest = |img: &[u8]| -> bool {
+        let Some(r) = rest else { return false };
+        if img == r {
+            return true;
+        }
+        if r.iter().all(|&v| v == 0) || img.len() != r.len() {
+            return false;
+        }
+        let half = |a: usize, b: usize| {
+            img.chunks(w)
+                .zip(r.chunks(w))
+                .all(|(x, y)| x[a..b] == y[a..b])
+        };
+        half(0, w / 2) || half(w / 2, w)
+    };
+    let mut recs: Vec<(Map<String, Value>, Vec<Pic>)> = Vec::new();
+    for s in scenes {
+        let mut fr: Vec<Pic> = s
+            .frames
+            .iter()
+            .filter(|f| f.1.len() == dots)
+            .map(|f| (f.0 as f64 / 1000.0, f.1.as_slice()))
+            .collect();
+        let t0 = fr.first().map_or(0.0, |f| f.0);
+        while fr.len() > 1 && half_rest(fr[0].1) {
+            fr.remove(0);
+        }
+        if fr.len() == 1 && half_rest(fr[0].1) {
+            fr.clear();
+        }
+        if o.blend && rest.is_some() {
+            while fr.len() > 1
+                && (blend_of_rest(fr[0].1) || Some(fr[0].1) == rest)
+                && fr[0].0 - t0 < 0.25
+            {
+                fr.remove(0);
+            }
+            while fr.len() > 1 && fr.last().map(|f| f.1) == rest {
+                fr.pop();
+            }
+            while fr.len() > 1 && fr.last().is_some_and(|f| blend_of_rest(f.1)) {
+                fr.pop();
+            }
+        }
+        // a flash of under 0.1 s that ends black: the command only cleared the screen
+        if let (Some(a), Some(z)) = (fr.first(), fr.last())
+            && z.0 - a.0 < 0.1
+            && z.1.iter().all(|&v| v == 0)
+        {
+            fr.clear();
+        }
+        let mut rec = Map::new();
+        rec.insert("id".into(), json!(s.id));
+        let lit = fr.iter().any(|f| f.1.iter().any(|&v| v != 0));
+        if fr.is_empty() || (s.kind == "none" && fr.len() <= 1) {
+            rec.insert("verdict".into(), json!("none"));
+        } else if !lit {
+            rec.insert("verdict".into(), json!("blank"));
+        } else {
+            let (a, z) = (fr[0].0, fr[fr.len() - 1].0);
+            rec.insert("frames".into(), json!(fr.len()));
+            rec.insert("length_s".into(), json!(round_to(z - a, 2)));
+            if s.kind == "end" {
+                rec.insert("verdict".into(), json!("end"));
+            } else {
+                let mut uniq: HashMap<&[u8], usize> = HashMap::new();
+                let keyed: Vec<(f64, f64, usize)> = fr
+                    .iter()
+                    .map(|f| {
+                        let n = uniq.len();
+                        (f.0, 0.0, *uniq.entry(f.1).or_insert(n))
+                    })
+                    .collect();
+                // sampled up to the start of the last picture
+                let series = sample_20hz(&keyed, a);
+                match periodicity(&series) {
+                    Periodic::Hold => {
+                        rec.insert("verdict".into(), json!("hold"));
+                    }
+                    Periodic::Running => {
+                        rec.insert("verdict".into(), json!("running"));
+                    }
+                    Periodic::Loop { from, lag, .. } => {
+                        rec.insert("verdict".into(), json!("loop"));
+                        rec.insert("cycle_s".into(), json!(round_to(lag as f64 * 0.05, 2)));
+                        rec.insert(
+                            "cycle_from_s".into(),
+                            json!(round_to(from as f64 * 0.05, 2)),
+                        );
+                    }
+                }
+            }
+        }
+        rec.extend(s.extra.clone());
+        recs.push((rec, fr));
+    }
+    if o.blend {
+        // a single still picture shared by many ids: the underlay, not a scene
+        let mut still: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+        for (k, (rec, fr)) in recs.iter().enumerate() {
+            let n = rec.get("frames").and_then(Value::as_u64).unwrap_or(0);
+            if (1..=2).contains(&n) && fr.iter().all(|f| f.1 == fr[0].1) {
+                still.entry(fr[0].1.to_vec()).or_default().push(k);
+            }
+        }
+        for ks in still.values().filter(|v| v.len() >= 5) {
+            for &k in ks {
+                let id = recs[k].0.get("id").cloned().unwrap_or(Value::Null);
+                let mut m = Map::new();
+                m.insert("id".into(), id);
+                m.insert("verdict".into(), json!("none"));
+                m.insert("note".into(), json!("underlay"));
+                recs[k] = (m, Vec::new());
+            }
+        }
+    }
+    std::fs::create_dir_all(outdir).map_err(|e| io_err(outdir, e))?;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut man = Vec::new();
+    for (rec, fr) in &recs {
+        let v = rec.get("verdict").and_then(Value::as_str).unwrap_or("none");
+        *counts.entry(v.to_string()).or_default() += 1;
+        if !matches!(v, "none" | "blank") {
+            let id = rec.get("id").and_then(Value::as_u64).unwrap_or(0);
+            write_scene(&outdir.join(format!("scene_{id:03}")), &g, fr, rec)?;
+        }
+        man.push(Value::Object(rec.clone()));
+    }
+    let mp = outdir.join("manifest.json");
+    let text = serde_json::to_string_pretty(&man).map_err(|e| io_err(&mp, e))?;
+    std::fs::write(&mp, text).map_err(|e| io_err(&mp, e))?;
+    Ok(Summary {
+        counts,
+        total: man.len(),
+    })
+}
+
+/// Pictures with durations (next start minus own start, the last 1 s) inside [a, b) seconds
+/// from the first picture.
+fn timed<'a>(fr: &[Pic<'a>], a: f64, b: f64) -> Vec<(f64, &'a [u8])> {
+    let t0 = fr.first().map_or(0.0, |f| f.0);
+    let mut out = Vec::new();
+    for (k, f) in fr.iter().enumerate() {
+        let s = f.0 - t0;
+        let e = fr.get(k + 1).map_or(s + 1.0, |n| n.0 - t0).max(s + 0.001);
+        if e > a && s < b {
+            let d = e.min(b) - s.max(a);
+            if d > 0.0 {
+                out.push((d, f.1));
+            }
+        }
+    }
+    out
+}
+
+fn write_scene(
+    dir: &Path,
+    g: &Geometry,
+    fr: &[Pic],
+    rec: &Map<String, Value>,
+) -> Result<(), String> {
+    let imgs: Vec<&[u8]> = fr.iter().map(|f| f.1).collect();
+    super::write_frames(&dir.join("frames"), g, &imgs)?;
+    super::write_sheet(&dir.join("sheet.png"), g, &imgs)?;
+    let cycle = match (
+        rec.get("cycle_from_s").and_then(Value::as_f64),
+        rec.get("cycle_s").and_then(Value::as_f64),
+    ) {
+        (Some(a), Some(c)) => Some((a, c)),
+        _ => None,
+    };
+    let end = cycle.map_or(f64::INFINITY, |(a, c)| a + c);
+    super::write_gif(&dir.join("anim.gif"), g, &timed(fr, 0.0, end))?;
+    if let Some((a, c)) = cycle {
+        super::write_gif(&dir.join("loop.gif"), g, &timed(fr, a, a + c))?;
+    }
+    Ok(())
+}
+
+/// Read a scan folder of text dumps (`<cmd>_<id>.txt`: `0x<ms>` then one row of level digits
+/// per line, a blank line after each picture) and its log (`id verdict ...` per line).
+pub fn read_dumps(dir: &Path, log: &Path) -> Result<Vec<Scene>, String> {
+    let text = std::fs::read_to_string(log).map_err(|e| io_err(log, e))?;
+    let mut kind: HashMap<u32, String> = HashMap::new();
+    for l in text.lines() {
+        let mut f = l.split_whitespace();
+        if let (Some(id), Some(k)) = (f.next(), f.next())
+            && let Ok(id) = id.parse()
+        {
+            kind.insert(id, k.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    let rd = std::fs::read_dir(dir).map_err(|e| io_err(dir, e))?;
+    for e in rd.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(id) = name
+            .strip_suffix(".txt")
+            .and_then(|n| n.rsplit('_').next())
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let p = e.path();
+        let t = std::fs::read_to_string(&p).map_err(|err| io_err(&p, err))?;
+        let mut frames = Vec::new();
+        for block in t.split("\n\n").filter(|b| !b.trim().is_empty()) {
+            let mut rows = block.lines();
+            let Some(ms) = rows
+                .next()
+                .and_then(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+            else {
+                continue;
+            };
+            let px: Vec<u8> = rows
+                .flat_map(|r| r.chars().map(|c| c.to_digit(16).unwrap_or(0) as u8))
+                .collect();
+            frames.push((ms, px));
+        }
+        out.push(Scene {
+            id,
+            kind: kind.get(&id).cloned().unwrap_or_default(),
+            frames,
+            extra: Map::new(),
+        });
+    }
+    out.sort_by_key(|s| s.id);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pic(v: u8) -> Vec<u8> {
+        vec![v; 128 * 32]
+    }
+
+    #[test]
+    fn resting_screen_dropped_and_verdicts() {
+        let rest = pic(1);
+        let mut scenes = Vec::new();
+        for id in 0..3 {
+            scenes.push(Scene {
+                id,
+                kind: "end".into(),
+                frames: vec![(0, rest.clone()), (100, pic(2 + id as u8)), (900, pic(3))],
+                extra: Map::new(),
+            });
+        }
+        scenes.push(Scene {
+            id: 3,
+            kind: "none".into(),
+            frames: vec![(0, rest.clone())],
+            extra: Map::new(),
+        });
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/scenes-test");
+        let o = Opts {
+            geometry: Geometry::linear(128, 32, 4),
+            blend: false,
+        };
+        let s = export(&scenes, &o, &dir).expect("export");
+        assert_eq!(s.counts.get("end"), Some(&3));
+        assert_eq!(s.counts.get("none"), Some(&1));
+        assert!(dir.join("scene_000/frames/f0001.png").exists());
+        assert!(!dir.join("scene_000/frames/f0002.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

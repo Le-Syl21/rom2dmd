@@ -3,6 +3,7 @@ mod capcom;
 mod de16;
 mod de32;
 mod de64;
+mod export;
 mod gts3;
 mod sam;
 mod scan;
@@ -46,6 +47,47 @@ fn frame_cycles() -> u64 {
     } else {
         de32::CYCLES_PER_FRAME_DE
     }
+}
+
+fn scene_export_cli(args: &[String]) -> Result<(), String> {
+    use std::path::Path;
+    const USAGE: &str =
+        "usage: rom2dmd scene-export <scandir> <scan.log> <outdir> [--blend] [--pal v,v,...]";
+    if args.len() < 5 {
+        return Err(USAGE.into());
+    }
+    let scenes = export::scenes::read_dumps(Path::new(&args[2]), Path::new(&args[3]))?;
+    let (w, h) = scenes
+        .iter()
+        .find_map(|s| s.frames.first().map(|f| f.1.len()))
+        .map_or((128, 32), |n| match n {
+            2048 => (128, 16),
+            12288 => (192, 64),
+            8192 => (256, 32),
+            _ => (128, 32),
+        });
+    let mut o = export::scenes::Opts {
+        geometry: export::Geometry::linear(w, h, 4),
+        blend: false,
+    };
+    let mut it = args[5..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--blend" => o.blend = true,
+            "--pal" => {
+                o.geometry.palette = it
+                    .next()
+                    .ok_or(USAGE)?
+                    .split(',')
+                    .map(|v| v.parse::<u8>().map_err(|_| USAGE.to_string()))
+                    .collect::<Result<_, _>>()?
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let s = export::scenes::export(&scenes, &o, Path::new(&args[4]))?;
+    println!("{:?} total {}", s.counts, s.total);
+    Ok(())
 }
 
 fn main() {
@@ -696,6 +738,30 @@ fn main() {
         Some(c) if c.starts_with("sam-") => sam::cli(&args),
         // cap-*: Capcom main board (see capcom.rs)
         Some(c) if c.starts_with("cap-") => capcom::cli(&args),
+        // wpc-export <scandir> <game> <outdir>: classify and export a wpc-scan output
+        Some("wpc-export") => {
+            if args.len() < 5 {
+                eprintln!("usage: rom2dmd wpc-export <scandir> <game> <outdir>");
+                std::process::exit(2);
+            }
+            let res = export::wpc::read_scan_dir(std::path::Path::new(&args[2]), &args[3])
+                .and_then(|p| export::wpc::export(&p, std::path::Path::new(&args[4])));
+            match res {
+                Ok(s) => println!("{} {:?} total {}", args[3], s.counts, s.total),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // scene-export <scandir> <scan.log> <outdir> [--blend] [--pal v,v,...]: export the text
+        // dumps of a de16/de32/de64/gts3/alvg/cap/sam scan
+        Some("scene-export") => {
+            if let Err(e) = scene_export_cli(&args) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         // wpc-*: Williams WPC CPU board, DMD generation (see wpc/mod.rs)
         Some(c) if c.starts_with("wpc-") => wpc::cli(&args),
         _ => eprintln!("usage: rom2dmd de32-boot <dmd.rom> <secs> <out.txt>"),

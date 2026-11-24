@@ -11,6 +11,9 @@ mos6502 = "0.10.1"
 i8051 = "0.25.0"
 arm32_cpu = "0.1.2"
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
+png = "0.18.1"
+gif = "0.14.2"
+serde_json = "1.0.154"
 
 [dev-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
