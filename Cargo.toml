@@ -2,6 +2,22 @@
 name = "rom2dmd"
 version = "0.1.0"
 edition = "2024"
+description = "Extract the display animations of a pinball ROM set (WPC, Data East, Whitestar, Sega, Gottlieb System 3, Alvin G., Capcom, Stern SAM) by emulating its display board"
+license = "BSD-3-Clause"
+repository = "https://github.com/Le-Syl21/rom2dmd"
+readme = "README.md"
+keywords = ["pinball", "pinmame", "dmd", "emulation", "zedmd"]
+categories = ["emulators", "multimedia::images"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
+
+# The library (this package, published) does the extraction; the command line (cli/, not
+# published) adds the file export and the debug tools.
+[workspace]
+members = [".", "cli"]
+
+[features]
+# The command line's file export: PNG pictures and sheets, GIF animations, manifest.
+export = ["dep:png", "dep:gif"]
 
 [dependencies]
 mc6809-core = "0.3.2"
@@ -11,13 +27,13 @@ mos6502 = "0.10.1"
 i8051 = "0.25.0"
 arm32_cpu = "0.1.2"
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
-png = "0.18.1"
-gif = "0.14.2"
+png = { version = "0.18.1", optional = true }
+gif = { version = "0.14.2", optional = true }
 serde_json = "1.0.154"
+log = "0.4"
 
 [dev-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
 
 # the WPC board tests run tens of emulated seconds
 [profile.test]

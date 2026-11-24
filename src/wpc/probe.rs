@@ -270,7 +270,7 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/roms-full", std::env::var("HOME").unwrap_or_default()));
         let path = format!("{dir}/{zip}");
         if !std::path::Path::new(&path).exists() {
-            eprintln!("{path} absent, skipped");
+            log::info!("{path} absent, skipped");
             return None;
         }
         super::super::load_rom(&path, None).ok()

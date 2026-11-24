@@ -167,7 +167,7 @@ impl crate::scan::Dmd for Board {
     fn send(&mut self, byte: u8) {
         if std::env::var("GTS3_DEBUG").is_ok() {
             let m = &self.cpu.memory;
-            eprintln!(
+            log::info!(
                 "send {byte:02x}: pc {:04x} cyc {} crtc {:02x?} bank {:x} st {} ws {:?}",
                 self.cpu.registers.program_counter,
                 self.cpu.cycles,

@@ -198,9 +198,8 @@ struct Cap {
     mono_run: u32,
     last_ref: Option<Box<Pic>>,
     pat: (u64, u64, u64),
-    raw: std::io::BufWriter<std::fs::File>,
+    raw: String,
     raw_idx: HashMap<[u8; PAGE_SIZE], usize>,
-    raw_err: Option<std::io::Error>,
 }
 
 /// Options of one pass.
@@ -218,7 +217,8 @@ pub struct IdResult {
     pub killer_other: bool,
     pub log: String,
     pub nd: String,
-    pub raw_part: PathBuf,
+    /// The effect's raw refresh log (`#id`, `=k hex`, `tick page k`).
+    pub raw: String,
 }
 
 /// The board with the tracer's instrumentation around every instruction.
@@ -489,7 +489,7 @@ impl<'c> Machine<'c> {
             && self.b.cycles < f + n
         {
             let g = self.b.cpu.registers();
-            eprintln!(
+            log::info!(
                 "T {} {:x} {:02x} {:02x} {:04x} {:04x} {:02x}",
                 self.b.cycles,
                 g.pc,
@@ -506,7 +506,7 @@ impl<'c> Machine<'c> {
         if let (Some(a), Some(v)) = (watch, wv)
             && self.b.bus.ram[a & 0x3fff] != v
         {
-            eprintln!(
+            log::info!(
                 "W {} {wpc:x} {v} -> {} bank {:x}",
                 self.b.cycles,
                 self.b.bus.ram[a & 0x3fff],
@@ -557,19 +557,15 @@ impl<'c> Machine<'c> {
         let Some(cap) = self.cap.as_mut() else {
             return;
         };
-        if cap.raw_err.is_none() {
+        {
+            use std::fmt::Write as _;
             let n = cap.raw_idx.len();
             let k = *cap.raw_idx.entry(buf).or_insert(n);
-            let mut res = Ok(());
+            // writing to a String cannot fail
             if k == n {
-                res = writeln!(cap.raw, "={k} {}", hex(&buf));
+                let _ = writeln!(cap.raw, "={k} {}", hex(&buf));
             }
-            if res.is_ok() {
-                res = writeln!(cap.raw, "{} {was} {k}", now - cap.t0);
-            }
-            if let Err(e) = res {
-                cap.raw_err = Some(e);
-            }
+            let _ = writeln!(cap.raw, "{} {was} {k}", now - cap.t0);
         }
         cap.win.push_back((now, was, buf));
         if cap.win.len() > 3 {
@@ -631,14 +627,14 @@ impl<'c> Machine<'c> {
                 .fold(0x811c_9dc5u32, |h, &v| {
                     (h ^ v as u32).wrapping_mul(0x0100_0193)
                 });
-            eprintln!(
+            log::info!(
                 "R {} {} {:x} {h:x}",
                 self.nrun,
                 self.b.cycles,
                 self.b.cpu.registers().pc
             );
             if std::env::var("ROM2DMD_WPC_BOOTLOG").is_ok_and(|v| v == "dump") {
-                eprintln!("RAM {}", hex(&self.b.bus.ram[..0x3000]));
+                log::info!("RAM {}", hex(&self.b.bus.ram[..0x3000]));
             }
         }
     }
@@ -803,18 +799,9 @@ impl<'c> Machine<'c> {
 
     /// Play effect `id` from `snap` and capture it. In `--compat` mode the snapshot is loaded
     /// over the current machine as WPC-EMU does (see `Board::restore_like_wpc_emu`).
-    pub fn capture(
-        &mut self,
-        id: u32,
-        snap: &Board,
-        o: PassOpts,
-        raw_part: &Path,
-    ) -> Result<IdResult, String> {
+    pub fn capture(&mut self, id: u32, snap: &Board, o: PassOpts) -> Result<IdResult, String> {
         let c = self.c;
-        let f =
-            std::fs::File::create(raw_part).map_err(|e| format!("{}: {e}", raw_part.display()))?;
-        let mut raw = std::io::BufWriter::new(f);
-        writeln!(raw, "#{id}").map_err(|e| format!("{}: {e}", raw_part.display()))?;
+        let raw = format!("#{id}\n");
         if c.compat {
             self.b.restore_like_wpc_emu(snap);
         } else {
@@ -869,7 +856,6 @@ impl<'c> Machine<'c> {
             pat: (0, 0, 0),
             raw,
             raw_idx: HashMap::new(),
-            raw_err: None,
         });
         let mut kind = "cap";
         for _ in 0..o.caps as u64 * 20 {
@@ -897,18 +883,8 @@ impl<'c> Machine<'c> {
         let cap = self.cap.take().ok_or("capture state lost")?;
         let y = self.yt.take().ok_or("effect state lost")?;
         let Cap {
-            evs,
-            evl,
-            pat,
-            mut raw,
-            raw_err,
-            ..
+            evs, evl, pat, raw, ..
         } = cap;
-        if let Some(e) = raw_err {
-            return Err(format!("{}: {e}", raw_part.display()));
-        }
-        raw.flush()
-            .map_err(|e| format!("{}: {e}", raw_part.display()))?;
         // every frame is "novel" (no background reference): first/last new picture
         let mut seen: HashSet<&Pic> = HashSet::new();
         let (mut first_novel, mut last_novel) = (None, None);
@@ -1013,7 +989,7 @@ impl<'c> Machine<'c> {
             killer_other: kind == "finite" && y.killer_other,
             log,
             nd,
-            raw_part: raw_part.to_path_buf(),
+            raw,
         })
     }
 }
@@ -1073,7 +1049,6 @@ fn run_pass(
     groups: &[Vec<u32>],
     o: PassOpts,
     threads: usize,
-    parts: &Path,
     tag: &str,
 ) -> Result<Vec<Vec<IdResult>>, String> {
     let total: usize = groups.iter().map(Vec::len).sum();
@@ -1087,17 +1062,18 @@ fn run_pass(
     let report = |gi: usize, pi: usize, r: Result<IdResult, String>| {
         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
         match &r {
-            Ok(x) => eprintln!(
+            Ok(x) => log::info!(
                 "{} pass {tag}: id {} {} ({n}/{total})",
-                c.game, x.id, x.kind
+                c.game,
+                x.id,
+                x.kind
             ),
-            Err(e) => eprintln!("{} pass {tag}: error {e}", c.game),
+            Err(e) => log::info!("{} pass {tag}: error {e}", c.game),
         }
         if let Ok(mut s) = slots.lock() {
             s[gi][pi] = Some(r);
         }
     };
-    let part = |id: u32| parts.join(format!("{tag}_{id}.raw"));
     let work: Vec<(usize, usize, u32)> = groups
         .iter()
         .enumerate()
@@ -1111,7 +1087,7 @@ fn run_pass(
                 sc.spawn(move || {
                     let mut m = Machine::new(carrier.clone(), c);
                     for (pi, &id) in g.iter().enumerate() {
-                        report(gi, pi, m.capture(id, snap, o, &part(id)));
+                        report(gi, pi, m.capture(id, snap, o));
                     }
                 });
             }
@@ -1125,7 +1101,7 @@ fn run_pass(
                         let Some(&(gi, pi, id)) = work.get(i) else {
                             break;
                         };
-                        report(gi, pi, m.capture(id, snap, o, &part(id)));
+                        report(gi, pi, m.capture(id, snap, o));
                     }
                 });
             }
@@ -1166,9 +1142,7 @@ fn write_chunks(
         for r in g {
             log.push_str(&r.log);
             nd.push_str(&r.nd);
-            let mut part = std::fs::File::open(&r.raw_part).map_err(|e| err(&r.raw_part, e))?;
-            std::io::copy(&mut part, &mut raw).map_err(|e| err(&rp, e))?;
-            std::fs::remove_file(&r.raw_part).map_err(|e| err(&r.raw_part, e))?;
+            raw.write_all(r.raw.as_bytes()).map_err(|e| err(&rp, e))?;
         }
         raw.flush().map_err(|e| err(&rp, e))?;
         std::fs::write(&lp, log).map_err(|e| err(&lp, e))?;
@@ -1426,25 +1400,22 @@ pub struct ScanOutput {
     pub header: String,
     /// Verdict counts of the passes.
     pub summary: String,
-    /// (`""`, `"byp"`, `"prot"`, chunks of results); raw logs are in each result's `raw_part`.
+    /// (`""`, `"byp"`, `"prot"`, chunks of results); each result carries its raw log.
     pub passes: Vec<(&'static str, Vec<Vec<IdResult>>)>,
 }
 
-/// Probe, boot and run the passes of `o.passes` for one game; each effect's raw log goes to
-/// a file in `parts` (see `IdResult::raw_part`).
+/// Probe, boot and run the passes of `o.passes` for one game.
 pub fn run_scan(
     rom: Vec<u8>,
     game: Option<&Game>,
     name: &str,
     o: &Opts,
-    parts: &Path,
 ) -> Result<ScanOutput, String> {
     let (cfg, p) = configure(&rom, game, name, o)?;
     let generation = o
         .generation
         .or(game.map(Game::generation))
         .unwrap_or(Generation::Dmd);
-    std::fs::create_dir_all(parts).map_err(|e| format!("{}: {e}", parts.display()))?;
     let compat = if o.compat {
         Compat::wpc_emu()
     } else {
@@ -1466,11 +1437,11 @@ pub fn run_scan(
             .collect::<Vec<_>>()
             .join(",")
     );
-    eprintln!("{header}");
+    log::info!("{header}");
     let mut m = Machine::new(board, &cfg);
     m.boot();
     header.push_str(&m.log);
-    eprint!("{}", m.log);
+    log::info!("{}", m.log);
     let ph = cfg.phase.unwrap_or(if m.snaps[1].is_some() {
         Phase::Play
     } else {
@@ -1501,7 +1472,6 @@ pub fn run_scan(
             &contiguous(&ids),
             opts,
             o.threads,
-            parts,
             "",
         )?;
         p1 = r1.iter().flatten().collect();
@@ -1526,7 +1496,6 @@ pub fn run_scan(
             &dealt(&refused),
             opts,
             o.threads,
-            parts,
             "byp",
         )?
     } else {
@@ -1547,16 +1516,7 @@ pub fn run_scan(
             bypass: true,
             protect: true,
         };
-        run_pass(
-            &cfg,
-            &snap,
-            &fresh,
-            &dealt(&cut),
-            opts,
-            o.threads,
-            parts,
-            "prot",
-        )?
+        run_pass(&cfg, &snap, &fresh, &dealt(&cut), opts, o.threads, "prot")?
     } else {
         Vec::new()
     };
@@ -1622,18 +1582,16 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         .unwrap_or_default();
     let (game, name) = resolve_game(&stem, o.game.as_deref())?;
     if game.is_none() {
-        eprintln!("warning: {name} is not in the game database: no switch names, no random play");
+        log::info!("warning: {name} is not in the game database: no switch names, no random play");
     }
     std::fs::create_dir_all(&outdir).map_err(|e| format!("{}: {e}", outdir.display()))?;
-    let parts = outdir.join(format!(".{name}_parts"));
-    let out = run_scan(rom, game.as_ref(), &name, &o, &parts)?;
+    let out = run_scan(rom, game.as_ref(), &name, &o)?;
     for (tag, r) in &out.passes {
         write_chunks(&outdir, &name, tag, &out.header, r)?;
     }
-    let _ = std::fs::remove_dir(&parts);
     let sp = outdir.join(format!("{name}.scan.txt"));
     std::fs::write(&sp, &out.summary).map_err(|e| format!("{}: {e}", sp.display()))?;
-    eprint!("{}", out.summary);
+    log::info!("{}", out.summary);
     Ok(())
 }
 
@@ -1690,7 +1648,7 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/roms-full", std::env::var("HOME").unwrap_or_default()));
         let path = format!("{dir}/t2_l8.zip");
         if !Path::new(&path).exists() {
-            eprintln!("{path} absent, skipped");
+            log::info!("{path} absent, skipped");
             return;
         }
         let rom = super::super::load_rom(&path, None).expect("t2 ROM");
@@ -1702,20 +1660,16 @@ mod tests {
         let mut m = Machine::new(board, &cfg);
         m.boot();
         let snap = m.snaps[1].take().expect("play snapshot");
-        let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/wpc-scan-test");
-        std::fs::create_dir_all(&out).expect("test dir");
-        let raw = out.join("t2_17.raw");
         let o = PassOpts {
             caps: 20,
             bypass: false,
             protect: false,
         };
-        let r = m.capture(17, &snap, o, &raw).expect("capture");
+        let r = m.capture(17, &snap, o).expect("capture");
         assert_eq!(r.kind, "finite", "{}", r.log);
-        let text = std::fs::read_to_string(&raw).expect("raw log");
+        let text = &r.raw;
         assert!(text.starts_with("#17\n"));
         let pages = text.lines().filter(|l| l.starts_with('=')).count();
         assert!(pages > 30, "{pages} distinct pages");
-        let _ = std::fs::remove_file(&raw);
     }
 }

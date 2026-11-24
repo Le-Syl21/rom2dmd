@@ -317,6 +317,7 @@ dependencies = [
  "arm32_cpu",
  "gif",
  "i8051",
+ "log",
  "m68k",
  "mc6809-core",
  "mos6502",
@@ -325,6 +326,14 @@ dependencies = [
  "serde_json",
  "zilog_z80",
  "zip",
+]
+
+[[package]]
+name = "rom2dmd-cli"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rom2dmd",
 ]
 
 [[package]]

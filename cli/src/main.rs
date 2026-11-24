@@ -1,15 +1,7 @@
-mod alvg;
-mod auto;
-mod capcom;
-mod de16;
-mod de32;
-mod de64;
-mod export;
-mod gts3;
-mod romset;
-mod sam;
-mod scan;
-mod wpc;
+//! `rom2dmd`: the command line of the rom2dmd library (the extraction with the file export),
+//! plus the debug subcommands used while bringing up each board.
+
+use rom2dmd::{alvg, auto, capcom, de16, de32, de64, export, gts3, sam, scan, wpc};
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -87,12 +79,32 @@ fn scene_export_cli(args: &[String]) -> Result<(), String> {
             _ => return Err(USAGE.into()),
         }
     }
-    let s = export::scenes::export(&scenes, &o, Path::new(&args[4]))?;
+    let s = export::write(&export::scenes::analyse(&scenes, &o), Path::new(&args[4]))?;
     println!("{:?} total {}", s.counts, s.total);
     Ok(())
 }
 
+/// The library's progress lines, on stderr.
+struct Stderr;
+
+impl log::Log for Stderr {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("{}", r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static LOG: Stderr = Stderr;
+
 fn main() {
+    if log::set_logger(&LOG).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         // de32-boot <dmd.rom> <secs> <out.txt>: run the board alone, no command.
@@ -747,7 +759,8 @@ fn main() {
                 std::process::exit(2);
             }
             let res = export::wpc::read_scan_dir(std::path::Path::new(&args[2]), &args[3])
-                .and_then(|p| export::wpc::export(&p, std::path::Path::new(&args[4])));
+                .and_then(|p| export::wpc::analyse(&p))
+                .and_then(|a| export::write(&a, std::path::Path::new(&args[4])));
             match res {
                 Ok(s) => println!("{} {:?} total {}", args[3], s.counts, s.total),
                 Err(e) => {

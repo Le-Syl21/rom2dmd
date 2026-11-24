@@ -495,7 +495,7 @@ pub fn cli(args: &[String]) {
         _ => run_cli(args),
     };
     if let Err(e) = res {
-        eprintln!("error: {e}");
+        log::info!("error: {e}");
         std::process::exit(1);
     }
 }
@@ -600,7 +600,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         return Err(format!("{}: {e}", args[4]));
     }
     log.out.flush().map_err(|e| format!("{}: {e}", args[4]))?;
-    eprintln!(
+    log::info!(
         "{} refreshes, pc {:04x}, bank {}, watchdog expiries {}, protected writes {}",
         board.refreshes,
         board.cpu.registers().pc,
@@ -622,7 +622,7 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/roms-full", std::env::var("HOME").unwrap_or_default()));
         let path = format!("{dir}/{zip}");
         if !std::path::Path::new(&path).exists() {
-            eprintln!("{path} absent, skipped");
+            log::info!("{path} absent, skipped");
             return None;
         }
         Some(load_rom(&path, None).expect("game ROM"))

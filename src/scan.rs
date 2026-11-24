@@ -191,7 +191,7 @@ pub fn scan_par<B: Dmd>(
 /// on stdout.
 pub fn scan<B: Dmd>(make: impl Fn() -> B, first: u32, last: u32, cap: f64, out: &str) {
     if let Err(e) = scan_files(make, first, last, cap, out) {
-        eprintln!("error: {e}");
+        log::info!("error: {e}");
         std::process::exit(1);
     }
 }

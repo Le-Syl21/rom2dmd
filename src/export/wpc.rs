@@ -23,7 +23,10 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
-use super::{Geometry, Periodic, Summary, io_err, par_map, periodicity, round_to, sample_20hz};
+use super::{
+    Analysed, Analysis, Geometry, Periodic, Shot, io_err, par_map, periodicity, round_to,
+    sample_20hz,
+};
 
 /// Ticks per second of the refresh log's time base.
 const TPS: f64 = 2_000_000.0;
@@ -340,6 +343,7 @@ fn classify(info: &Info, frames: &[Stable]) -> Map<String, Value> {
 }
 
 /// Python's `round` (ties to even) of `num / den`.
+#[cfg(feature = "export")]
 fn round_div(num: u32, den: u32) -> u32 {
     let (q, r) = (num / den, num % den);
     if 2 * r > den || (2 * r == den && q % 2 == 1) {
@@ -351,6 +355,7 @@ fn round_div(num: u32, den: u32) -> u32 {
 
 /// The eye model: each refresh shows one page; the glass brightness is the mean of the last 6
 /// refreshes, sampled at 60 fps from the first refresh up to `until` ticks after it.
+#[cfg(feature = "export")]
 fn eye(e: &Effect, until: Option<u64>) -> Vec<Vec<u8>> {
     const W: usize = 6;
     let r = &e.refreshes;
@@ -392,52 +397,8 @@ fn eye(e: &Effect, until: Option<u64>) -> Vec<Vec<u8>> {
     out
 }
 
-/// The part of `frames` inside [a, b) seconds, durations clipped.
-fn window(frames: &[Stable], a: f64, b: f64) -> Vec<(f64, &[u8])> {
-    frames
-        .iter()
-        .filter(|(t, d, _)| t + d > a && *t < b)
-        .map(|(t, d, img)| ((t + d).min(b) - t.max(a), img.as_slice()))
-        .filter(|(d, _)| *d > 0.0)
-        .collect()
-}
-
-/// Write one effect's folder.
-fn write_effect(
-    dir: &Path,
-    e: &Effect,
-    frames: &[Stable],
-    rec: &Map<String, Value>,
-) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|err| io_err(dir, err))?;
-    let rp = dir.join("raw.txt");
-    std::fs::write(&rp, &e.raw).map_err(|err| io_err(&rp, err))?;
-    let g = Geometry::linear(128, 32, 4);
-    let imgs: Vec<&[u8]> = frames.iter().map(|f| f.2.as_slice()).collect();
-    if imgs.is_empty() {
-        return Ok(());
-    }
-    super::write_frames(&dir.join("frames"), &g, &imgs)?;
-    super::write_sheet(&dir.join("sheet.png"), &g, &imgs)?;
-    let cycle = match (
-        rec.get("cycle_from_s").and_then(Value::as_f64),
-        rec.get("cycle_s").and_then(Value::as_f64),
-    ) {
-        (Some(a), Some(c)) => Some((a, c)),
-        _ => None,
-    };
-    let end = cycle.map_or(f64::INFINITY, |(a, c)| a + c);
-    super::write_gif(&dir.join("anim.gif"), &g, &window(frames, 0.0, end))?;
-    if let Some((a, c)) = cycle {
-        super::write_gif(&dir.join("loop.gif"), &g, &window(frames, a, a + c))?;
-    }
-    let until = cycle.map(|(a, c)| ((a + c) * TPS) as u64 + 2 * 16_384);
-    super::write_apng(&dir.join("eye.png"), 128, 32, &eye(e, until))
-}
-
-/// Merge the passes, classify every effect and write `outdir/effect_NNN/` and
-/// `outdir/manifest.json`.
-pub fn export(passes: &[PassText], outdir: &Path) -> Result<Summary, String> {
+/// Merge the passes and classify every effect.
+pub fn analyse(passes: &[PassText]) -> Result<Analysis, String> {
     let mut info: BTreeMap<Pass, BTreeMap<u32, Info>> = BTreeMap::new();
     let mut effects: BTreeMap<Pass, BTreeMap<u32, Effect>> = BTreeMap::new();
     for p in passes {
@@ -448,10 +409,9 @@ pub fn export(passes: &[PassText], outdir: &Path) -> Result<Summary, String> {
     let get = |p: Pass| info.get(&p).unwrap_or(&empty);
     let (normal, byp, prot) = (get(Pass::Normal), get(Pass::Bypassed), get(Pass::Protected));
     let ids: BTreeSet<u32> = normal.keys().chain(byp.keys()).copied().collect();
-    std::fs::create_dir_all(outdir).map_err(|e| io_err(outdir, e))?;
     let default = Info::default();
     let ids: Vec<u32> = ids.into_iter().collect();
-    let done = par_map(&ids, |&i| -> Result<Map<String, Value>, String> {
+    let done = par_map(&ids, |&i| -> Analysed {
         let (mut inf, mut src) = (normal.get(&i).unwrap_or(&default), Pass::Normal);
         if inf.kind.as_deref() == Some("refused")
             && let Some(b) = byp.get(&i)
@@ -500,28 +460,32 @@ pub fn export(passes: &[PassText], outdir: &Path) -> Result<Summary, String> {
         rec.insert("started".into(), json!(src.name()));
         rec.extend(v);
         rec.insert("stable_frames".into(), json!(frames.len()));
-        if let Some(e) = e {
-            write_effect(&outdir.join(format!("effect_{i:03}")), e, &frames, &rec)?;
+        #[cfg(feature = "export")]
+        let eye = e.map_or(Vec::new(), |e| {
+            let until = super::cycle(&rec).map(|(a, c)| ((a + c) * TPS) as u64 + 2 * 16_384);
+            eye(e, until)
+        });
+        #[cfg(not(feature = "export"))]
+        let eye = Vec::new();
+        let frames = if matches!(super::verdict(&rec), "blank") {
+            Vec::new()
+        } else {
+            frames
+                .into_iter()
+                .map(|(t, d, dots)| Shot { t, d, dots })
+                .collect()
+        };
+        Analysed {
+            rec,
+            frames,
+            raw: e.map(|e| e.raw.clone()),
+            eye,
         }
-        Ok(rec)
     });
-    let mut man = Vec::new();
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for rec in done {
-        let rec = rec?;
-        let v = rec
-            .get("verdict")
-            .and_then(Value::as_str)
-            .unwrap_or("missing");
-        *counts.entry(v.to_string()).or_default() += 1;
-        man.push(Value::Object(rec));
-    }
-    let mp = outdir.join("manifest.json");
-    let text = serde_json::to_string_pretty(&man).map_err(|e| io_err(&mp, e))?;
-    std::fs::write(&mp, text).map_err(|e| io_err(&mp, e))?;
-    Ok(Summary {
-        counts,
-        total: man.len(),
+    Ok(Analysis {
+        geometry: Geometry::linear(128, 32, 4),
+        folder: "effect",
+        items: done,
     })
 }
 
@@ -621,6 +585,7 @@ mod tests {
         assert_eq!(classify(&m[&6], &[])["verdict"], "silent");
     }
 
+    #[cfg(feature = "export")]
     #[test]
     fn python_round() {
         assert_eq!(round_div(255, 6), 42); // 42.5 -> 42

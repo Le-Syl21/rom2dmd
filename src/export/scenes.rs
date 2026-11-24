@@ -20,7 +20,9 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
-use super::{Geometry, Periodic, Summary, io_err, periodicity, round_to, sample_20hz};
+use super::{
+    Analysed, Analysis, Geometry, Periodic, Shot, io_err, periodicity, round_to, sample_20hz,
+};
 
 /// What a scan recorded for one scene id.
 #[derive(Clone, Debug, Default)]
@@ -45,8 +47,8 @@ pub struct Opts {
 
 type Pic<'a> = (f64, &'a [u8]);
 
-/// Write `outdir/scene_NNN/` and `outdir/manifest.json`.
-pub fn export(scenes: &[Scene], o: &Opts, outdir: &Path) -> Result<Summary, String> {
+/// Trim, classify and time every scene.
+pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
     let mut g = o.geometry.clone();
     let top = scenes
         .iter()
@@ -259,67 +261,45 @@ pub fn export(scenes: &[Scene], o: &Opts, outdir: &Path) -> Result<Summary, Stri
             }
         }
     }
-    std::fs::create_dir_all(outdir).map_err(|e| io_err(outdir, e))?;
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut man = Vec::new();
-    for (rec, fr) in &recs {
-        let v = rec.get("verdict").and_then(Value::as_str).unwrap_or("none");
-        *counts.entry(v.to_string()).or_default() += 1;
-        if !matches!(v, "none" | "blank") {
-            let id = rec.get("id").and_then(Value::as_u64).unwrap_or(0);
-            write_scene(&outdir.join(format!("scene_{id:03}")), &g, fr, rec)?;
-        }
-        man.push(Value::Object(rec.clone()));
-    }
-    let mp = outdir.join("manifest.json");
-    let text = serde_json::to_string_pretty(&man).map_err(|e| io_err(&mp, e))?;
-    std::fs::write(&mp, text).map_err(|e| io_err(&mp, e))?;
-    Ok(Summary {
-        counts,
-        total: man.len(),
-    })
-}
-
-/// Pictures with durations (next start minus own start, the last 1 s) inside [a, b) seconds
-/// from the first picture.
-fn timed<'a>(fr: &[Pic<'a>], a: f64, b: f64) -> Vec<(f64, &'a [u8])> {
-    let t0 = fr.first().map_or(0.0, |f| f.0);
-    let mut out = Vec::new();
-    for (k, f) in fr.iter().enumerate() {
-        let s = f.0 - t0;
-        let e = fr.get(k + 1).map_or(s + 1.0, |n| n.0 - t0).max(s + 0.001);
-        if e > a && s < b {
-            let d = e.min(b) - s.max(a);
-            if d > 0.0 {
-                out.push((d, f.1));
+    let items = recs
+        .into_iter()
+        .map(|(rec, fr)| {
+            let frames = if matches!(super::verdict(&rec), "none" | "blank") {
+                Vec::new()
+            } else {
+                timed(&fr)
+            };
+            Analysed {
+                rec,
+                frames,
+                raw: None,
+                eye: Vec::new(),
             }
-        }
+        })
+        .collect();
+    Analysis {
+        geometry: g,
+        folder: "scene",
+        items,
     }
-    out
 }
 
-fn write_scene(
-    dir: &Path,
-    g: &Geometry,
-    fr: &[Pic],
-    rec: &Map<String, Value>,
-) -> Result<(), String> {
-    let imgs: Vec<&[u8]> = fr.iter().map(|f| f.1).collect();
-    super::write_frames(&dir.join("frames"), g, &imgs)?;
-    super::write_sheet(&dir.join("sheet.png"), g, &imgs)?;
-    let cycle = match (
-        rec.get("cycle_from_s").and_then(Value::as_f64),
-        rec.get("cycle_s").and_then(Value::as_f64),
-    ) {
-        (Some(a), Some(c)) => Some((a, c)),
-        _ => None,
-    };
-    let end = cycle.map_or(f64::INFINITY, |(a, c)| a + c);
-    super::write_gif(&dir.join("anim.gif"), g, &timed(fr, 0.0, end))?;
-    if let Some((a, c)) = cycle {
-        super::write_gif(&dir.join("loop.gif"), g, &timed(fr, a, a + c))?;
-    }
-    Ok(())
+/// Pictures with their start from the first picture and their duration (next start minus
+/// own start, the last 1 s), in seconds.
+fn timed(fr: &[Pic]) -> Vec<Shot> {
+    let t0 = fr.first().map_or(0.0, |f| f.0);
+    fr.iter()
+        .enumerate()
+        .map(|(k, f)| {
+            let s = f.0 - t0;
+            let e = fr.get(k + 1).map_or(s + 1.0, |n| n.0 - t0).max(s + 0.001);
+            Shot {
+                t: s,
+                d: e - s,
+                dots: f.1.to_vec(),
+            }
+        })
+        .collect()
 }
 
 /// Read a scan folder of text dumps (`<cmd>_<id>.txt`: `0x<ms>` then one row of level digits
@@ -402,17 +382,15 @@ mod tests {
             frames: vec![(0, rest.clone())],
             extra: Map::new(),
         });
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/scenes-test");
         let o = Opts {
             geometry: Geometry::linear(128, 32, 4),
             blend: false,
         };
-        let s = export(&scenes, &o, &dir).expect("export");
+        let a = analyse(&scenes, &o);
+        let s = a.summary();
         assert_eq!(s.counts.get("end"), Some(&3));
         assert_eq!(s.counts.get("none"), Some(&1));
-        assert!(dir.join("scene_000/frames/f0001.png").exists());
-        assert!(!dir.join("scene_000/frames/f0002.png").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(a.items[0].frames.len(), 2);
     }
 
     #[test]
@@ -428,16 +406,13 @@ mod tests {
                 extra: Map::new(),
             })
             .collect();
-        let dir =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/scenes-test-anim");
         let o = Opts {
             geometry: Geometry::linear(128, 32, 4),
             blend: false,
         };
-        let s = export(&scenes, &o, &dir).expect("export");
+        let a = analyse(&scenes, &o);
+        let s = a.summary();
         assert_eq!(s.counts.get("end"), Some(&3));
-        assert!(dir.join("scene_000/frames/f0000.png").exists());
-        assert!(!dir.join("scene_000/frames/f0001.png").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(a.items[0].frames.len(), 1);
     }
 }

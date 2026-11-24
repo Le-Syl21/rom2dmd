@@ -17,25 +17,25 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 use crate::export::scenes::{self, Scene};
-use crate::export::{Geometry, Summary, wpc as xwpc};
+use crate::export::{Analysis, Geometry, wpc as xwpc};
 use crate::romset::{Family, RomSet};
 use crate::scan::{self, Cfg as ScanCfg};
 
 pub const USAGE: &str =
     "usage: rom2dmd <rom.zip> <outdir> [--threads n] [--ids a-b,c,...] [--keep-work]";
 
-/// Options of the single command.
+/// Options of a scan.
 #[derive(Clone, Debug)]
 pub struct Opts {
     pub threads: usize,
     pub ids: Option<Vec<u32>>,
-    /// Keep the WPC scan's chunk files (`outdir/scan/`).
-    pub keep_work: bool,
+    /// Write the WPC scan's chunk files into this folder.
+    pub keep_work: Option<PathBuf>,
 }
 
+#[cfg(feature = "export")]
 fn parse_ids(s: &str) -> Option<Vec<u32>> {
     let mut v = Vec::new();
     for p in s.split(',').filter(|x| !x.is_empty()) {
@@ -47,6 +47,7 @@ fn parse_ids(s: &str) -> Option<Vec<u32>> {
     Some(v)
 }
 
+#[cfg(feature = "export")]
 pub fn cli(args: &[String]) -> Result<(), String> {
     if args.len() < 3 {
         return Err(USAGE.into());
@@ -54,7 +55,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     let mut o = Opts {
         threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         ids: None,
-        keep_work: false,
+        keep_work: None,
     };
     let mut it = args[3..].iter();
     while let Some(a) = it.next() {
@@ -67,7 +68,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
                     .ok_or(USAGE)?
             }
             "--ids" => o.ids = Some(it.next().and_then(|v| parse_ids(v)).ok_or(USAGE)?),
-            "--keep-work" => o.keep_work = true,
+            "--keep-work" => o.keep_work = Some(Path::new(&args[2]).join("scan")),
             _ => return Err(format!("unknown option {a}\n{USAGE}")),
         }
     }
@@ -171,11 +172,9 @@ pub fn identify(zip: &Path) -> Result<String, String> {
     Ok(format!("{}: {} {what}", rs.set, rs.family.name()))
 }
 
-/// Identify, scan and export one ROM zip into `outdir`.
-pub fn run(zip: &Path, outdir: &Path, o: &Opts) -> Result<(), String> {
-    let t = Instant::now();
-    let rs = crate::romset::open(zip)?;
-    eprintln!(
+/// Scan and analyse an opened set: the analysis and the scan note (`scan.txt`).
+pub fn analyse(rs: &RomSet, o: &Opts) -> Result<(Analysis, String), String> {
+    log::info!(
         "{}: {} ({})",
         rs.set,
         rs.family.name(),
@@ -185,18 +184,39 @@ pub fn run(zip: &Path, outdir: &Path, o: &Opts) -> Result<(), String> {
             rs.roms.join(", ")
         }
     );
-    std::fs::create_dir_all(outdir).map_err(|e| format!("{}: {e}", outdir.display()))?;
-    let summary = match rs.family {
-        Family::Wpc(g) => wpc(&rs, g, outdir, o)?,
+    match rs.family {
+        Family::Wpc(g) => wpc(rs, g, o),
         _ => {
-            let (scenes, opts, note) = board_scenes(&rs, o)?;
-            eprintln!("{}: exporting", rs.set);
-            let s = scenes::export(&scenes, &opts, outdir)?;
-            write_note(outdir, &rs, &note)?;
-            s
+            let (scenes, opts, note) = board_scenes(rs, o)?;
+            log::info!("{}: analysing", rs.set);
+            let note = format!(
+                "rom2dmd {} set {} family {}\n{note}",
+                env!("CARGO_PKG_VERSION"),
+                rs.set,
+                rs.family.name()
+            );
+            Ok((scenes::analyse(&scenes, &opts), note))
         }
-    };
-    eprintln!(
+    }
+}
+
+/// Identify, scan and export one ROM zip into `outdir`: the scene folders, `manifest.json`,
+/// `scan.txt` and the DMD dump `<set>.txt`.
+#[cfg(feature = "export")]
+pub fn run(zip: &Path, outdir: &Path, o: &Opts) -> Result<(), String> {
+    let t = std::time::Instant::now();
+    let rs = crate::romset::open(zip)?;
+    let (an, note) = analyse(&rs, o)?;
+    log::info!("{}: writing", rs.set);
+    let summary = crate::export::write(&an, outdir)?;
+    let p = outdir.join("scan.txt");
+    std::fs::write(&p, note).map_err(|e| format!("{}: {e}", p.display()))?;
+    let x = crate::Extraction::from_analysis(&rs, an, String::new());
+    let p = outdir.join(format!("{}.txt", rs.set));
+    let f = std::fs::File::create(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    x.write_dump(std::io::BufWriter::new(f))
+        .map_err(|e| format!("{}: {e}", p.display()))?;
+    log::info!(
         "{}: {:?} total {} in {:.0} s -> {}",
         rs.set,
         summary.counts,
@@ -207,24 +227,13 @@ pub fn run(zip: &Path, outdir: &Path, o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
-fn write_note(outdir: &Path, rs: &RomSet, note: &str) -> Result<(), String> {
-    let p = outdir.join("scan.txt");
-    let text = format!(
-        "rom2dmd {} set {} family {}\n{note}",
-        env!("CARGO_PKG_VERSION"),
-        rs.set,
-        rs.family.name()
-    );
-    std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))
-}
-
 /// A progress line per finished id.
 fn progress(set: &str, total: usize) -> impl Fn(&Scene) + Sync {
     let done = AtomicUsize::new(0);
     let set = set.to_string();
     move |s: &Scene| {
         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!("{set}: id {} {} ({n}/{total})", s.id, s.kind);
+        log::info!("{set}: id {} {} ({n}/{total})", s.id, s.kind);
     }
 }
 
@@ -397,7 +406,7 @@ fn capcom(rs: &RomSet, o: &Opts) -> Result<(Vec<Scene>, scenes::Opts, String), S
     // a first boot on a fresh NVRAM gets past the "NVRAM corrupted" message; every scene
     // then starts from that NVRAM
     let boot = crate::capcom::nvram_boot_s(&rs.set);
-    eprintln!(
+    log::info!(
         "{}: DM_ADD {:08x} {:?}, {} scenes; first boot {boot} s for the NVRAM",
         rs.set,
         p.dmadd,
@@ -441,7 +450,7 @@ fn sam(rs: &RomSet, o: &Opts) -> Result<(Vec<Scene>, scenes::Opts, String), Stri
     let flash = rs.rom(0)?;
     let p = crate::sam::probe(flash)
         .ok_or_else(|| format!("{}: SAM display-effect API not found", rs.set))?;
-    eprintln!("{}: {p:x?}; booting 30 s", rs.set);
+    log::info!("{}: {p:x?}; booting 30 s", rs.set);
     let s0 = crate::sam::boot_for_deffs(Arc::new(flash.to_vec()), &rs.set, 30.0);
     let c = crate::sam::DeffCfg::from_probe(&p);
     let ids = ids_or(o, 1..p.n.max(1));
@@ -461,13 +470,12 @@ fn sam(rs: &RomSet, o: &Opts) -> Result<(Vec<Scene>, scenes::Opts, String), Stri
     ))
 }
 
-/// WPC: probe, boot, the three passes, then the effect export.
+/// WPC: probe, boot, the three passes, then the effect analysis.
 fn wpc(
     rs: &RomSet,
     generation: crate::wpc::Generation,
-    outdir: &Path,
     o: &Opts,
-) -> Result<Summary, String> {
+) -> Result<(Analysis, String), String> {
     use crate::wpc::scan as ws;
     let rom = if rs.roms.is_empty() {
         crate::wpc::load_rom_files(&rs.files)?
@@ -476,7 +484,7 @@ fn wpc(
     };
     let (game, name) = ws::resolve_game(&rs.set, None)?;
     if game.is_none() {
-        eprintln!(
+        log::info!(
             "{}: not in the WPC-EMU switch database: no random play, attract-mode snapshot",
             rs.set
         );
@@ -487,9 +495,7 @@ fn wpc(
         threads: o.threads,
         ..ws::Opts::default()
     };
-    let work: PathBuf = outdir.join("scan");
-    let parts = work.join(".parts");
-    let out = ws::run_scan(rom, game.as_ref(), &name, &opts, &parts)?;
+    let out = ws::run_scan(rom, game.as_ref(), &name, &opts)?;
     let mut passes = Vec::new();
     for (tag, chunks) in &out.passes {
         let pass = match *tag {
@@ -501,11 +507,10 @@ fn wpc(
         for r in chunks.iter().flatten() {
             log.push_str(&r.log);
             nd.push_str(&r.nd);
-            let part = std::fs::read_to_string(&r.raw_part)
-                .map_err(|e| format!("{}: {e}", r.raw_part.display()))?;
-            raw.push_str(&part);
+            raw.push_str(&r.raw);
         }
-        if o.keep_work {
+        if let Some(work) = &o.keep_work {
+            std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
             for (ext, text) in [("log", &log), ("effects.ndjson", &nd), ("raw", &raw)] {
                 let p = work.join(format!("{name}_{tag}1.{ext}"));
                 std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -513,15 +518,8 @@ fn wpc(
         }
         passes.push(xwpc::PassText { pass, log, nd, raw });
     }
-    let _ = std::fs::remove_dir_all(&parts);
-    if !o.keep_work {
-        let _ = std::fs::remove_dir_all(&work);
-    }
-    eprintln!("{}: exporting", rs.set);
-    let s = xwpc::export(&passes, outdir)?;
-    let p = outdir.join("scan.txt");
-    std::fs::write(&p, &out.summary).map_err(|e| format!("{}: {e}", p.display()))?;
-    Ok(s)
+    log::info!("{}: analysing", rs.set);
+    Ok((xwpc::analyse(&passes)?, out.summary))
 }
 
 #[cfg(test)]
@@ -535,7 +533,7 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/roms-full", std::env::var("HOME").unwrap_or_default()));
         let p = PathBuf::from(dir).join(format!("{name}.zip"));
         if !p.exists() {
-            eprintln!("{} absent, skipped", p.display());
+            log::info!("{} absent, skipped", p.display());
             return None;
         }
         Some(crate::romset::open(&p).expect("ROM set"))

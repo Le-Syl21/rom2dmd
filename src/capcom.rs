@@ -983,7 +983,7 @@ pub fn cli(args: &[String]) {
             let t = std::time::Instant::now();
             for k in 0..((secs * 10.0) as u64) {
                 b.run(CLOCK_HZ / 10);
-                eprintln!(
+                log::info!(
                     "{k:4} pc {:08x} sr {:04x} dmd {:08x} isr {:04x} icr {:04x} snd {} ({:.1} s real)",
                     b.cpu.pc,
                     b.cpu.get_sr(),
@@ -1235,12 +1235,12 @@ pub fn cli(args: &[String]) {
                     }
                 }
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    log::info!("error: {e}");
                     std::process::exit(1);
                 }
             }
         }
-        _ => eprintln!("unknown cap subcommand"),
+        _ => log::info!("unknown cap subcommand"),
     }
 }
 

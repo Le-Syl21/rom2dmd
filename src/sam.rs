@@ -1239,7 +1239,7 @@ pub fn cli(args: &[String]) {
                         last = p;
                     }
                 });
-                eprintln!(
+                log::info!(
                     "{k:4} pc {:08x} cyc {} mode {:?} pages {:?} instr {} ({:.1} s real)",
                     s.pc(),
                     s.bus.cycles,
@@ -1260,7 +1260,7 @@ pub fn cli(args: &[String]) {
             let hex = |k: &str| env(k).and_then(|v| u32::from_str_radix(&v, 16).ok());
             let (Some(hook), Some(start), Some(cur)) = (hex("HOOK"), hex("START"), hex("CUR"))
             else {
-                eprintln!("sam-deff needs HOOK, START and CUR (hex), e.g. from sam-probe");
+                log::info!("sam-deff needs HOOK, START and CUR (hex), e.g. from sam-probe");
                 std::process::exit(2);
             };
             let mut c = DeffCfg {
@@ -1280,7 +1280,7 @@ pub fn cli(args: &[String]) {
             let mut last: u32 = args[4].parse().unwrap_or(1);
             let out = &args[6];
             if let Err(e) = std::fs::create_dir_all(out) {
-                eprintln!("{out}: {e}");
+                log::info!("{out}: {e}");
                 std::process::exit(1);
             }
             let s0 = boot_for_deffs(rom, &rom_name(&args[2]), boot);
@@ -1292,7 +1292,7 @@ pub fn cli(args: &[String]) {
                 } else {
                     s.peek32(np)
                 };
-                eprintln!("effect count {n}");
+                log::info!("effect count {n}");
                 last = last.min(n.saturating_sub(1));
             }
             c.cap_s = c.cap_s.max(0.1);
@@ -1322,7 +1322,7 @@ pub fn cli(args: &[String]) {
                     std::io::Write::flush(&mut o)
                 });
                 if let Err(e) = res {
-                    eprintln!("{p}: {e}");
+                    log::info!("{p}: {e}");
                     std::process::exit(1);
                 }
             }
@@ -1331,7 +1331,7 @@ pub fn cli(args: &[String]) {
         "sam-probe" => match probe(&load_rom(&args[2])) {
             Some(p) => println!("{p:x?}"),
             None => {
-                eprintln!("no display-effect API found");
+                log::info!("no display-effect API found");
                 std::process::exit(1);
             }
         },
@@ -1347,6 +1347,6 @@ pub fn cli(args: &[String]) {
             std::fs::write(format!("{}.ram", args[4]), &s.bus.ram).unwrap();
             std::fs::write(format!("{}.nvram", args[4]), &s.bus.nvram).unwrap();
         }
-        _ => eprintln!("unknown sam subcommand"),
+        _ => log::info!("unknown sam subcommand"),
     }
 }

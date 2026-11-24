@@ -171,10 +171,12 @@ mod tests {
     /// (tests/cpu_diff.rs explains how it is made); skipped when absent.
     #[test]
     fn matches_wpc_emu_cycle_counts() {
-        let path = std::env::var("ROM2DMD_CPU_REF")
-            .unwrap_or_else(|_| "/home/sylvain/.cache/claude-work/rea/wpcemu/diff/ref.json".into());
+        let Ok(path) = std::env::var("ROM2DMD_CPU_REF") else {
+            log::info!("ROM2DMD_CPU_REF not set, skipped");
+            return;
+        };
         let Ok(txt) = std::fs::read_to_string(&path) else {
-            eprintln!("no reference at {path}, skipped");
+            log::info!("no reference at {path}, skipped");
             return;
         };
         let cases: Vec<Case> = serde_json::from_str(&txt).unwrap();
@@ -203,14 +205,16 @@ mod tests {
             if got != c.cycles {
                 bad += 1;
                 if bad < 20 {
-                    eprintln!(
+                    log::info!(
                         "op {:02x} case {}: model {got} wpc-emu {}",
-                        c.op, c.i, c.cycles
+                        c.op,
+                        c.i,
+                        c.cycles
                     );
                 }
             }
         }
-        eprintln!("{bad} mismatches in {total} cases");
+        log::info!("{bad} mismatches in {total} cases");
         assert_eq!(bad, 0);
     }
 }

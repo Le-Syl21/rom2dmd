@@ -73,8 +73,10 @@ fn explained(c: &Case, got: &[u32], cyc: u64, w: &[(u16, u8)], m: &[u8]) -> bool
 
 #[test]
 fn matches_wpc_emu_cpu() {
-    let path = std::env::var("ROM2DMD_CPU_REF")
-        .unwrap_or_else(|_| "/home/sylvain/.cache/claude-work/rea/wpcemu/diff/ref.json".into());
+    let Ok(path) = std::env::var("ROM2DMD_CPU_REF") else {
+        eprintln!("ROM2DMD_CPU_REF not set, skipped");
+        return;
+    };
     let Ok(txt) = std::fs::read_to_string(&path) else {
         eprintln!("no reference at {path}, skipped");
         return;

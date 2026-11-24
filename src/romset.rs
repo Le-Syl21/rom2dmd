@@ -132,9 +132,17 @@ impl RomSet {
 
 /// Read every file of a zip.
 pub fn read_zip(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    let f = std::fs::File::open(path).map_err(|e| err(&e))?;
-    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(f)).map_err(|e| err(&e))?;
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    read_zip_from(std::io::BufReader::new(f), &path.display().to_string())
+}
+
+/// Read every file of a zip from any reader; `label` names it in errors.
+pub fn read_zip_from<R: std::io::Read + std::io::Seek>(
+    r: R,
+    label: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let err = |e: &dyn std::fmt::Display| format!("{label}: {e}");
+    let mut zip = zip::ZipArchive::new(r).map_err(|e| err(&e))?;
     let mut out = Vec::new();
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(|e| err(&e))?;
@@ -157,6 +165,28 @@ pub fn open(path: &Path) -> Result<RomSet, String> {
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
+    identify_files(&stem, files, &path.display().to_string())
+}
+
+/// Open and identify a ROM zip held in memory; `name` is the zip's file name (its stem is
+/// the PinMAME set name when it is one).
+pub fn open_bytes(name: &str, zip: &[u8]) -> Result<RomSet, String> {
+    let files = read_zip_from(std::io::Cursor::new(zip), name)?;
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    identify_files(&stem, files, name)
+}
+
+/// Identify a set from its files; `stem` is the zip's name without extension, `label` names
+/// the zip in errors.
+fn identify_files(
+    stem: &str,
+    files: Vec<(String, Vec<u8>)>,
+    label: &str,
+) -> Result<RomSet, String> {
+    let stem = stem.to_string();
     let names: Vec<String> = files.iter().map(|(n, _)| n.to_lowercase()).collect();
     let has = |i: &SetInfo| i.roms.iter().all(|r| names.contains(r));
     let tab = table();
@@ -184,7 +214,7 @@ pub fn open(path: &Path) -> Result<RomSet, String> {
     if let Some(i) = by_name {
         return Err(format!(
             "{}: the zip lacks ROM files of set {} ({}); a clone set may need its parent's files",
-            path.display(),
+            label,
             i.set,
             i.roms.join(", ")
         ));
@@ -211,7 +241,7 @@ pub fn open(path: &Path) -> Result<RomSet, String> {
     }
     Err(format!(
         "{}: not a known PinMAME set and no supported board recognised (files: {})",
-        path.display(),
+        label,
         names.join(", ")
     ))
 }
