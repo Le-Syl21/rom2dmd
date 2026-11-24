@@ -145,7 +145,10 @@ pub fn scan_one<B: Dmd>(mut b: B, id: u32, c: &Cfg) -> (Scene, u8, u32) {
             b.send(0);
             args += 1;
         }
-        let last = frames.borrow().last().map(|f| f.0).unwrap_or(t0);
+        // Silence is counted from the command at the earliest: the boot picture kept as
+        // the first frame may be older than the 3 s (a still boot screen), which ended
+        // the scene before the board had read the command.
+        let last = frames.borrow().last().map_or(t0, |f| f.0.max(t0));
         if b.cycles() - last > 3 * B::CLOCK_HZ {
             kind = "end";
             break;
