@@ -260,11 +260,17 @@ impl Cfg {
     }
 
     /// Find the two addresses in the program ROM: the routine that waits for the next command
-    /// byte starts `jnb INT0 flag; mov a,38h; cjne a,37h` (`d2 97 e5 38 04 b5 37`), and the main
-    /// loop calls it then the dispatcher and jumps back (`lcall get; lcall ...; sjmp -8`).
+    /// byte compares the queue pointers (`mov a,38h; inc a; cjne a,37h`, `e5 38 04 b5 37`),
+    /// preceded on later programs by `setb P1.7` (`d2 97`) where the routine then starts; the
+    /// main loop calls it then the dispatcher and jumps back (`lcall get; lcall ...; sjmp -8`).
     pub fn probe(code: &[u8], pca020: bool) -> Option<Self> {
-        const SIG: [u8; 7] = [0xd2, 0x97, 0xe5, 0x38, 0x04, 0xb5, 0x37];
-        let get = code.windows(SIG.len()).position(|w| w == SIG)?;
+        const SIG: [u8; 5] = [0xe5, 0x38, 0x04, 0xb5, 0x37];
+        let at = code.windows(SIG.len()).position(|w| w == SIG)?;
+        let get = if at >= 2 && code[at - 2..at] == [0xd2, 0x97] {
+            at - 2
+        } else {
+            at
+        };
         let [hi, lo] = (get as u16).to_be_bytes();
         let call = code.windows(8).position(|w| {
             w[0] == 0x12 && w[1] == hi && w[2] == lo && w[3] == 0x12 && w[6] == 0x80 && w[7] == 0xf8

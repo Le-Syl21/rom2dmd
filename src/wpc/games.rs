@@ -120,7 +120,16 @@ pub fn find(name: &str) -> Option<Game> {
     if let Some(g) = games.iter().find(|g| g.name == n) {
         return Some(g.clone());
     }
-    games.into_iter().find(|g| g.known.contains(&n))
+    if let Some(g) = games.iter().find(|g| g.known.contains(&n)) {
+        return Some(g.clone());
+    }
+    // another version of a known game: PinMAME names are `<game prefix>_<version>`
+    let prefix = n.rsplit_once('_').map(|(p, _)| p)?;
+    games.into_iter().find(|g| {
+        g.known
+            .iter()
+            .any(|k| k.rsplit_once('_').is_some_and(|(p, _)| p == prefix))
+    })
 }
 
 /// Start-up settings of one game (defaults: none of them).
@@ -197,5 +206,7 @@ mod tests {
             Some(Generation::Security)
         );
         assert_eq!(settings("fishtales").snapn, 2);
+        assert_eq!(find("afm_03").map(|g| g.name), Some("afm".to_string()));
+        assert!(find("nosuchgame").is_none());
     }
 }
