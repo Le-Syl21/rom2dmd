@@ -1,6 +1,6 @@
 [package]
 name = "rom2dmd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Extract the display animations of a pinball ROM set (WPC, Data East, Whitestar, Sega, Gottlieb System 3, Alvin G., Capcom, Stern SAM) by emulating its display board"
 license = "BSD-3-Clause"

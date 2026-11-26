@@ -1,6 +1,6 @@
 [package]
 name = "rom2dmd-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Command line of rom2dmd: extract a pinball ROM set's display animations to pictures, animations and a DMD dump"
 license = "BSD-3-Clause"
