@@ -149,6 +149,8 @@ pub struct Settings {
     pub attract_s: Option<u32>,
     /// RAM bytes cleared at injection (when empty, the probe's skip flag).
     pub zero: Vec<u16>,
+    /// Switches closed after attract on top of the database's power-on set.
+    pub closed: Vec<u8>,
 }
 
 /// Per-game differences found by hand (the reference runner's `wpc_games.tsv`):
@@ -159,6 +161,8 @@ pub struct Settings {
 /// - fishtales: the first play request is effect 16, whose companion task kills any effect
 ///   that replaces it, so the second request is the snapshot. fishtales/tpz zero their "skip
 ///   this effect" flag (the probe finds it on every game now).
+/// - cc: the train and the mine must sit at home (switches 72 and 77), else the game is stuck
+///   in its mech check and refuses every effect.
 pub fn settings(game: &str) -> Settings {
     let mut s = Settings {
         snapn: 1,
@@ -179,6 +183,7 @@ pub fn settings(game: &str) -> Settings {
             s.zero = vec![0x432];
         }
         "tpz" => s.zero = vec![0x486],
+        "cc" => s.closed = vec![72, 77],
         _ => {}
     }
     s
@@ -206,6 +211,7 @@ mod tests {
             Some(Generation::Security)
         );
         assert_eq!(settings("fishtales").snapn, 2);
+        assert_eq!(settings("cc").closed, vec![72, 77]);
         assert_eq!(find("afm_03").map(|g| g.name), Some("afm".to_string()));
         assert!(find("nosuchgame").is_none());
     }

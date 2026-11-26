@@ -1230,7 +1230,11 @@ pub fn configure(
         attract_s: opts.attract_s.or(set.attract_s).unwrap_or(120),
         phase: opts.phase,
         starts: opts.starts,
-        closed_extra: opts.closed.clone(),
+        closed_extra: if opts.closed.is_empty() {
+            set.closed.clone()
+        } else {
+            opts.closed.clone()
+        },
         closed,
         actions,
         trough,
