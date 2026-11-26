@@ -8,8 +8,12 @@
 //! other shades, in the first 0.1 s of at least half the scenes at the same time). With `blend`
 //! (Gottlieb's temporal combiner) the mixtures of the resting screen at both ends of a scene are
 //! dropped too, and a single still picture shared by 5 or more ids is the picture under the
-//! score layer that an ignored command leaves (`none`). An ended scene also loses the black or
-//! resting pictures it ends on (the board clearing the screen, the boot picture coming back).
+//! score layer that an ignored command leaves (`none`). A scene loses the black it starts on;
+//! an ended scene also loses the black or resting pictures it ends on (the board clearing the
+//! screen, the boot picture coming back) and the game's own display coming back (pictures among
+//! the last six of a tenth of the ended scenes, e.g. each phase of a blinking score screen). Two
+//! pictures whose first one opens 5 or more such scenes and no longer one are a placeholder for
+//! an id without a scene (Whitestar's "EFFECT nn"): `none`.
 //!
 //! Verdicts: `end` (the scene ended), `loop` (ran to the cap and repeats: `cycle_from_s`,
 //! `cycle_s`), `hold` (ran to the cap on one picture), `running` (ran to the cap, not
@@ -64,7 +68,9 @@ pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
     // the resting screen: the most common first picture (first seen wins a tie)
     let mut firsts: Vec<(&[u8], usize)> = Vec::new();
     for s in scenes {
-        if let Some(f) = s.frames.first() {
+        // past the black the board may clear the screen to first
+        let first = s.frames.iter().find(|f| f.1.iter().any(|&v| v != 0));
+        if let Some(f) = first.or(s.frames.first()) {
             match firsts.iter_mut().find(|x| x.0 == f.1.as_slice()) {
                 Some(x) => x.1 += 1,
                 None => firsts.push((&f.1, 1)),
@@ -136,6 +142,47 @@ pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
         };
         half(0, w / 2) || half(w / 2, w)
     };
+    // The game's own display coming back after a scene (the score screen in each phase of its
+    // blinking): the pictures among the last six of at least a tenth of the scenes.
+    let mut lasts: HashMap<&[u8], usize> = HashMap::new();
+    let mut n_ended = 0usize;
+    for s in scenes.iter().filter(|s| !s.frames.is_empty()) {
+        n_ended += 1;
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for f in s.frames.iter().rev().take(6) {
+            if !seen.contains(&f.1.as_slice()) {
+                seen.push(&f.1);
+                *lasts.entry(&f.1).or_default() += 1;
+            }
+        }
+    }
+    let floor = 5.max(n_ended.div_ceil(10));
+    let closing: Vec<&[u8]> = lasts
+        .into_iter()
+        .filter(|&(_, n)| n >= floor)
+        .map(|(p, _)| p)
+        .collect();
+    // The combiner's mixtures of its phases match none of them exactly: a picture differing
+    // from one of them by no more dots than the phases differ from each other (the blinking
+    // part, at most a tenth of the screen) is that display too.
+    let diff = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+    let mut tol = 0;
+    for (k, a) in closing.iter().enumerate() {
+        for b in &closing[k + 1..] {
+            let d = diff(a, b);
+            if d <= dots / 10 {
+                tol = tol.max(d);
+            }
+        }
+    }
+    let game_display = |p: &[u8]| {
+        closing.contains(&p)
+            || (tol > 0
+                && p.iter().any(|&v| v != 0)
+                && closing
+                    .iter()
+                    .any(|c| c.iter().any(|&v| v != 0) && diff(p, c) <= tol))
+    };
     let mut recs: Vec<(Map<String, Value>, Vec<Pic>)> = Vec::new();
     for s in scenes {
         let mut fr: Vec<Pic> = s
@@ -151,7 +198,8 @@ pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
                     .iter()
                     .any(|r| r.1 == f.1 && r.0 as f64 == (f.0 * 1000.0).round())
         };
-        while fr.len() > 1 && resting_pic(&fr[0]) {
+        // the resting screen and the black the board clears the screen to before drawing
+        while fr.len() > 1 && (resting_pic(&fr[0]) || fr[0].1.iter().all(|&v| v == 0)) {
             fr.remove(0);
         }
         if fr.len() == 1 && resting_pic(&fr[0]) {
@@ -178,17 +226,51 @@ pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
         {
             fr.clear();
         }
+        // the game's own display still on screen before the scene draws
+        while fr.len() > 1 && (game_display(fr[0].1) || fr[0].1.iter().all(|&v| v == 0)) {
+            fr.remove(0);
+        }
+        if fr.len() == 1 && game_display(fr[0].1) {
+            fr.clear();
+        }
+        // Run to the cap but showing the game's own display for a second or more (the board
+        // did not report the end, as Gottlieb's): the scene ended where that display took
+        // over, whatever the game shows next (its attract cycle).
+        let mut ended = s.kind == "end";
+        if !ended && !closing.is_empty() {
+            let mut run: Option<(usize, bool)> = None;
+            for (i, f) in fr.iter().enumerate() {
+                let black = f.1.iter().all(|&v| v == 0);
+                if !black && !game_display(f.1) {
+                    run = None;
+                    continue;
+                }
+                let r = run.get_or_insert((i, false));
+                r.1 |= !black;
+                if r.1 && f.0 - fr[r.0].0 >= 1.0 {
+                    let k = r.0;
+                    fr.truncate(k);
+                    ended = true;
+                    break;
+                }
+            }
+        }
         // An ended scene hands the screen back: the black or resting pictures it ends on (the
         // board clearing the screen, the boot picture coming back) are not part of it.
-        if s.kind == "end" {
+        if ended {
             while fr.len() > 1
                 && fr.last().is_some_and(|f| {
                     f.1.iter().all(|&v| v == 0)
                         || Some(f.1) == rest
                         || resting.iter().any(|r| r.1 == f.1)
+                        || game_display(f.1)
                 })
             {
                 fr.pop();
+            }
+            // nothing but the game's own display: the scene drew nothing of its own
+            if fr.len() == 1 && game_display(fr[0].1) {
+                fr.clear();
             }
         }
         // only the resting screen, still or shimmering (its dots in any shades): the command
@@ -207,8 +289,11 @@ pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
             let (a, z) = (fr[0].0, fr[fr.len() - 1].0);
             rec.insert("frames".into(), json!(fr.len()));
             rec.insert("length_s".into(), json!(round_to(z - a, 2)));
-            if s.kind == "end" {
+            if ended {
                 rec.insert("verdict".into(), json!("end"));
+            } else if fr.iter().all(|f| f.1 == fr[0].1) {
+                // one picture to the cap
+                rec.insert("verdict".into(), json!("hold"));
             } else {
                 let mut uniq: HashMap<&[u8], usize> = HashMap::new();
                 let keyed: Vec<(f64, f64, usize)> = fr
@@ -240,6 +325,31 @@ pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
         }
         rec.extend(s.extra.clone());
         recs.push((rec, fr));
+    }
+    // A placeholder for an id the game has no scene for (Whitestar draws "EFFECT" then
+    // "EFFECT nn"): two pictures, the first one opening 5 or more such scenes and no longer one.
+    let mut opens: HashMap<&[u8], (Vec<usize>, bool)> = HashMap::new();
+    for (k, (rec, fr)) in recs.iter().enumerate() {
+        let Some(first) = fr.first() else { continue };
+        let e = opens.entry(first.1).or_default();
+        if super::verdict(rec) == "end" && fr.len() == 2 {
+            e.0.push(k);
+        } else {
+            e.1 = true;
+        }
+    }
+    for (ks, _) in opens
+        .into_values()
+        .filter(|(ks, long)| ks.len() >= 5 && !long)
+    {
+        for k in ks {
+            let id = recs[k].0.get("id").cloned().unwrap_or(Value::Null);
+            let mut m = Map::new();
+            m.insert("id".into(), id);
+            m.insert("verdict".into(), json!("none"));
+            m.insert("note".into(), json!("placeholder"));
+            recs[k] = (m, Vec::new());
+        }
     }
     if o.blend {
         // a single still picture shared by many ids: the underlay, not a scene
@@ -414,5 +524,86 @@ mod tests {
         let s = a.summary();
         assert_eq!(s.counts.get("end"), Some(&3));
         assert_eq!(a.items[0].frames.len(), 1);
+    }
+
+    /// A small picture: `n` dots lit from `at`
+    fn dots(at: usize, n: usize, v: u8) -> Vec<u8> {
+        let mut p = vec![0; 128 * 32];
+        p[at..at + n].fill(v);
+        p
+    }
+
+    #[test]
+    fn placeholders_none() {
+        // "EFFECT" then "EFFECT nn" for six ids, a real scene for two others
+        let label = dots(0, 40, 3);
+        let mut scenes: Vec<Scene> = (0..6)
+            .map(|id| Scene {
+                id,
+                kind: "end".into(),
+                frames: vec![(0, label.clone()), (50, dots(0, 50 + id as usize, 3))],
+                extra: Map::new(),
+            })
+            .collect();
+        for id in 6..8 {
+            scenes.push(Scene {
+                id,
+                kind: "end".into(),
+                frames: vec![
+                    (0, dots(500, 9, 2)),
+                    (40, dots(700, 9, id as u8 - 4)),
+                    (90, dots(900, 9, 1)),
+                ],
+                extra: Map::new(),
+            });
+        }
+        let o = Opts {
+            geometry: Geometry::linear(128, 32, 4),
+            blend: false,
+        };
+        let s = analyse(&scenes, &o).summary();
+        assert_eq!(s.counts.get("none"), Some(&6));
+        assert_eq!(s.counts.get("end"), Some(&2));
+    }
+
+    #[test]
+    fn game_display_cut_from_capped_scenes() {
+        // a score screen blinking in two phases (and black) comes back after each scene and
+        // the board never reports the end
+        let (on, off) = (dots(100, 30, 3), dots(100, 10, 3));
+        let blink = |t0: u64| -> Vec<(u64, Vec<u8>)> {
+            (0..10)
+                .map(|k| {
+                    (
+                        t0 + 300 * k,
+                        [on.clone(), off.clone(), vec![0; 128 * 32]][k as usize % 3].clone(),
+                    )
+                })
+                .collect()
+        };
+        let scenes: Vec<Scene> = (0..6)
+            .map(|id| {
+                let mut frames = vec![
+                    (0, on.clone()),
+                    (200, dots(2000 + 60 * id as usize, 50, 2)),
+                    (400, dots(2100 + id as usize, 50, 3)),
+                ];
+                frames.extend(blink(600));
+                Scene {
+                    id,
+                    kind: "cap".into(),
+                    frames,
+                    extra: Map::new(),
+                }
+            })
+            .collect();
+        let o = Opts {
+            geometry: Geometry::linear(128, 32, 4),
+            blend: false,
+        };
+        let a = analyse(&scenes, &o);
+        assert_eq!(a.summary().counts.get("end"), Some(&6));
+        // the score before and after is gone: the two own pictures stay
+        assert!(a.items.iter().all(|it| it.frames.len() == 2));
     }
 }

@@ -482,11 +482,99 @@ pub fn analyse(passes: &[PassText]) -> Result<Analysis, String> {
             eye,
         }
     });
+    let mut done = done;
+    trim_edges(&mut done);
     Ok(Analysis {
         geometry: Geometry::linear(128, 32, 4),
         folder: "effect",
         items: done,
     })
+}
+
+/// Drop what belongs to no effect: the black an effect starts on (the screen cleared before it
+/// draws) and, once it ended, the game's own display coming back. That display (the score
+/// screen, in each phase of its blinking) is found as the last pictures shared by at least a
+/// tenth of the ended effects. An effect left with nothing lit only showed the game's display:
+/// `silent`.
+fn trim_edges(items: &mut [Analysed]) {
+    let ended = |it: &Analysed| matches!(super::verdict(&it.rec), "finite" | "cut");
+    let mut lasts: HashMap<&[u8], usize> = HashMap::new();
+    let mut n_ended = 0usize;
+    for it in items.iter().filter(|it| ended(it)) {
+        n_ended += 1;
+        // every picture of the closing run counts once, so each blink phase is seen
+        let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+        for f in it.frames.iter().rev().take(6) {
+            if seen.insert(&f.dots) {
+                *lasts.entry(&f.dots).or_default() += 1;
+            }
+        }
+    }
+    let floor = 5.max(n_ended.div_ceil(10));
+    let rest: BTreeSet<Vec<u8>> = lasts
+        .into_iter()
+        .filter(|&(_, n)| n >= floor)
+        .map(|(p, _)| p.to_vec())
+        .collect();
+    let black = |s: &Shot| s.dots.iter().all(|&v| v == 0);
+    for it in items.iter_mut() {
+        if it.frames.is_empty() {
+            continue;
+        }
+        let was_ended = ended(it);
+        let lead = it.frames.iter().take_while(|s| black(s)).count();
+        let mut keep = it.frames.len();
+        if was_ended {
+            while keep > lead
+                && (black(&it.frames[keep - 1]) || rest.contains(&it.frames[keep - 1].dots))
+            {
+                keep -= 1;
+            }
+        }
+        if lead == 0 && keep == it.frames.len() {
+            continue;
+        }
+        let t0 = it.frames.get(lead).map_or(0.0, |s| s.t);
+        let tail_end = it.frames.get(keep).map(|s| s.t);
+        let mut fr: Vec<Shot> = it.frames.drain(..).take(keep).skip(lead).collect();
+        for s in &mut fr {
+            s.t = round_to(s.t - t0, 4);
+        }
+        // the eye model runs from the first refresh at 60 fps: cut it to the same span
+        if !it.eye.is_empty() {
+            let a = ((t0 * 60.0).floor() as usize).min(it.eye.len());
+            let b = tail_end.map_or(it.eye.len(), |e| {
+                ((e * 60.0).ceil() as usize).clamp(a, it.eye.len())
+            });
+            it.eye = it.eye[a..b].to_vec();
+        }
+        if !fr.iter().any(|s| !black(s)) {
+            it.rec.insert("verdict".into(), json!("silent"));
+            for k in [
+                "killer",
+                "length_s",
+                "cycle_from_s",
+                "cycle_s",
+                "repeat_score",
+            ] {
+                it.rec.remove(k);
+            }
+            it.rec.insert("stable_frames".into(), json!(0));
+            it.frames = Vec::new();
+            it.eye = Vec::new();
+            continue;
+        }
+        if tail_end.is_some() {
+            let len: f64 = fr.iter().map(|s| s.d).sum();
+            it.rec.insert("length_s".into(), json!(round_to(len, 2)));
+        }
+        if let Some(a) = it.rec.get("cycle_from_s").and_then(Value::as_f64) {
+            it.rec
+                .insert("cycle_from_s".into(), json!(round_to((a - t0).max(0.0), 2)));
+        }
+        it.rec.insert("stable_frames".into(), json!(fr.len()));
+        it.frames = fr;
+    }
 }
 
 /// Read the chunk files `wpc-scan` wrote for `game` in `dir` (`<game>_<n>`, `<game>_byp<n>`,
