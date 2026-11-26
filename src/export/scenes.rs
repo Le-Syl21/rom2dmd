@@ -13,7 +13,9 @@
 //! screen, the boot picture coming back) and the game's own display coming back (pictures among
 //! the last six of a tenth of the ended scenes, e.g. each phase of a blinking score screen). Two
 //! pictures whose first one opens 5 or more such scenes and no longer one are a placeholder for
-//! an id without a scene (Whitestar's "EFFECT nn"): `none`.
+//! an id without a scene (Whitestar's "EFFECT nn"): `none`. So is one animation repeated
+//! picture for picture by 10 or more ids and at least a fifth of the animated scenes (Striker
+//! Xtreme's shimmering logo, Big Hurt's attract score screen): the game's own display.
 //!
 //! Verdicts: `end` (the scene ended), `loop` (ran to the cap and repeats: `cycle_from_s`,
 //! `cycle_s`), `hold` (ran to the cap on one picture), `running` (ran to the cap, not
@@ -52,6 +54,11 @@ pub struct Opts {
 type Pic<'a> = (f64, &'a [u8]);
 
 /// Trim, classify and time every scene.
+/// An animation repeated picture for picture by at least this many ids...
+const SHARED_MIN: usize = 10;
+/// ...and by at least one animated scene in this many is the game's own display.
+const SHARED_SHARE: usize = 5;
+
 pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
     let mut g = o.geometry.clone();
     let top = scenes
@@ -351,6 +358,31 @@ pub fn analyse(scenes: &[Scene], o: &Opts) -> Analysis {
             recs[k] = (m, Vec::new());
         }
     }
+    // One animation answering a large share of the ids, picture for picture (Striker Xtreme's
+    // shimmering logo, Big Hurt's attract score screen): the game's own display coming back,
+    // not a scene of each id.
+    let animated = recs.iter().filter(|(_, fr)| fr.len() >= 2).count();
+    let mut same: HashMap<Vec<&[u8]>, Vec<usize>> = HashMap::new();
+    for (k, (_, fr)) in recs.iter().enumerate() {
+        if fr.len() >= 2 {
+            same.entry(fr.iter().map(|f| f.1).collect())
+                .or_default()
+                .push(k);
+        }
+    }
+    for ks in same
+        .into_values()
+        .filter(|ks| ks.len() >= SHARED_MIN && SHARED_SHARE * ks.len() >= animated)
+    {
+        for k in ks {
+            let id = recs[k].0.get("id").cloned().unwrap_or(Value::Null);
+            let mut m = Map::new();
+            m.insert("id".into(), id);
+            m.insert("verdict".into(), json!("none"));
+            m.insert("note".into(), json!("shared"));
+            recs[k] = (m, Vec::new());
+        }
+    }
     if o.blend {
         // a single still picture shared by many ids: the underlay, not a scene
         let mut still: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
@@ -564,6 +596,47 @@ mod tests {
         let s = analyse(&scenes, &o).summary();
         assert_eq!(s.counts.get("none"), Some(&6));
         assert_eq!(s.counts.get("end"), Some(&2));
+    }
+
+    #[test]
+    fn shared_animation_none() {
+        // the same animation for twelve ids (a fifth of the scenes), a real scene for forty
+        // others; every scene hands back to the blinking score screen
+        let tail = |t0: u64| -> Vec<(u64, Vec<u8>)> {
+            (0..6)
+                .map(|i| (t0 + 300 * i, dots(3500, [200, 100][i as usize % 2], 3)))
+                .collect()
+        };
+        let logo: Vec<(u64, Vec<u8>)> = (0..8)
+            .map(|i| (40 * i as u64, dots(100 * i, 60, (i % 3 + 1) as u8)))
+            .collect();
+        let mut scenes: Vec<Scene> = (0..12)
+            .map(|id| Scene {
+                id,
+                kind: "end".into(),
+                frames: logo.iter().cloned().chain(tail(400)).collect(),
+                extra: Map::new(),
+            })
+            .collect();
+        for id in 12..52 {
+            let k = id as usize;
+            scenes.push(Scene {
+                id,
+                kind: "end".into(),
+                frames: (0..8)
+                    .map(|i| (40 * i as u64, dots(7 * (8 * k + i), 300, 3)))
+                    .chain(tail(400))
+                    .collect(),
+                extra: Map::new(),
+            });
+        }
+        let o = Opts {
+            geometry: Geometry::linear(128, 32, 4),
+            blend: false,
+        };
+        let s = analyse(&scenes, &o).summary();
+        assert_eq!(s.counts.get("none"), Some(&12));
+        assert_eq!(s.counts.get("end"), Some(&40));
     }
 
     #[test]
