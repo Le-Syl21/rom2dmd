@@ -518,6 +518,12 @@ fn trim_edges(items: &mut [Analysed]) {
         .collect();
     let black = |s: &Shot| s.dots.iter().all(|&v| v == 0);
     for it in items.iter_mut() {
+        if super::verdict(&it.rec) == "silent" {
+            // never drew: what the display showed is the game's own screen
+            it.frames.clear();
+            it.eye.clear();
+            continue;
+        }
         if it.frames.is_empty() {
             continue;
         }
